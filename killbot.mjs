@@ -300,6 +300,21 @@ function dateFromIso(iso) {
   return String(iso ?? '').slice(0, 10);
 }
 
+// Bot Log timestamp in Eastern time (America/New_York handles EST/EDT
+// automatically). Format: "2026-06-02 1:06 PM EDT". Bot Log is for human
+// review, not parsing — readable beats ISO precision here.
+function easternTimestamp(d = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: 'numeric', minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  }).formatToParts(d);
+  const g = (t) => parts.find((p) => p.type === t)?.value ?? '';
+  return `${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')} ${g('dayPeriod')} ${g('timeZoneName')}`;
+}
+
 function formatDateMDY(yyyyMmDd) {
   const [y, m, d] = yyyyMmDd.split('-');
   return `${Number(m)}/${Number(d)}/${y}`;
@@ -863,6 +878,27 @@ async function ensureBotLogLayout() {
       fields: 'userEnteredFormat(horizontalAlignment,verticalAlignment,wrapStrategy)',
     },
   });
+  // Clear any background highlight on data rows (row 2+). Header row 1 keeps
+  // its yellow fill — explicitly not touched. Without this, when a row is
+  // appended via INSERT_ROWS Google sometimes inherits the previous row's
+  // fill, which was leaving new entries highlighted yellow.
+  requests.push({
+    repeatCell: {
+      range: { sheetId: BOT_LOG_SHEET_ID, startRowIndex: 1, startColumnIndex: 0, endColumnIndex: 12 },
+      cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 1, blue: 1 } } },
+      fields: 'userEnteredFormat.backgroundColor',
+    },
+  });
+  // Force black foreground text across the whole used range (rows 1..500, A:L)
+  // so the yellow header keeps its background but text stays readable, and
+  // data rows don't pick up muted/grey text from sheet themes.
+  requests.push({
+    repeatCell: {
+      range: { sheetId: BOT_LOG_SHEET_ID, startRowIndex: 0, endRowIndex: 500, startColumnIndex: 0, endColumnIndex: 12 },
+      cell: { userEnteredFormat: { textFormat: { foregroundColor: { red: 0, green: 0, blue: 0 } } } },
+      fields: 'userEnteredFormat.textFormat.foregroundColor',
+    },
+  });
   try {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SHEET_ID,
@@ -1099,7 +1135,7 @@ async function main() {
       return n == null ? '' : String(n);
     })();
     await appendLog([
-      new Date().toISOString(),
+      easternTimestamp(),
       ctNumStr,
       adset.id,
       adset.name,

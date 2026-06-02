@@ -44,7 +44,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // 1. Meta API: POST status=PAUSED on the adset.
-// 2. Hit Rate sheet (May tab): write 'PAUSED' to column R for that row.
+// 2. Hit Rate sheet (adset's launch-month tab — e.g. May, June): write
+//    'PAUSED' to column R for that row.
 // 3. Bot Log: append the kill record.
 // 4. Learnings Doc: create a new tab named after the adset and pre-fill:
 //    - Metrics block (Date Range = adset start → today, spend, ROAS, CPA,
@@ -68,8 +69,15 @@ const SHEET_ID = '1NuOZWgP0mGhJ_MO6vevXj9EEpSxM94iUsFOULsEjehs';
 const BOT_LOG_SHEET_ID = 352736976; // 'Bot Log' tab sheetId (for batchUpdate dimension ops)
 const KPI_SHEET_ID = '1GWTUjvuYnSrn64nrqfLB9AsAKwDm4JCnk6c4nbhWM1A';
 const LEARNINGS_DOC_ID = '1vl5TQiCdfnbpA711Y5IpFl8ZkwmMvf3KQZu0Pq6Q3RE';
-const MAY_TAB = 'May'; // sheet tab name for current month rows (sheet rollover is manual)
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+// Sheet tab per ad is derived from the adset's launch month (e.g. start_time
+// 2026-06-01 → 'June' tab). A May-launched adset that gets paused in June still
+// writes to its May row. Avoids the prior bug where a hardcoded 'May' silently
+// no-op'd every June ad (no rowNum match → no status write, no hypothesis pull,
+// no Ad Set ID autofill).
+function tabNameForIso(iso) {
+  return MONTH_NAMES[new Date(String(iso).slice(0, 10) + 'T00:00:00Z').getUTCMonth()];
+}
 const META_API = 'https://graph.facebook.com/v25.0';
 const DRY_RUN = (process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false';
 const RECONCILE_WINDOW_DAYS = 7; // refresh settled metrics for adsets paused within this many days
@@ -331,7 +339,9 @@ function evaluate(m, hoursSinceAdsetStart, breakeven) {
 
 // Sheet column W (zero-indexed 22) = Ad Set ID. Column A (0) = Creative Test #.
 // For any row missing W, match by adset name starting with `CT<#>` and write back.
-async function autofillAdSetIds(rows, header, idx, activeAdsets) {
+// `tab` is the sheet tab the rows came from (e.g. 'May', 'June') — every write
+// targets that same tab.
+async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
   const adsetById = new Map(activeAdsets.map((a) => [a.id, a]));
   // Match `CT<#>` anywhere in the adset name with word boundaries on both
   // sides. Handles both `CT12 | Breathe | Lead v2` (old convention) and
@@ -360,12 +370,20 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets) {
     }
     const match = adsetsByCt.get(ct);
     if (!match) {
-      console.log(`  Row ${r + 1} (CT${ct}): no ACTIVE adset matching prefix CT${ct} — leaving Ad Set ID blank.`);
+      console.log(`  [${tab}] Row ${r + 1} (CT${ct}): no ACTIVE adset matching prefix CT${ct} — leaving Ad Set ID blank.`);
       continue;
     }
-    console.log(`  Row ${r + 1} (CT${ct}): auto-filling Ad Set ID = ${match.id} (${match.name})`);
+    // Only autofill on the row's own launch-month tab. Prevents writing a
+    // June-launched adset's ID into a May row that happens to share a CT#.
+    const rowLaunch = String(rows[r]?.[idx.launch] ?? '').trim();
+    const adsetLaunchTab = tabNameForIso(match.start_time);
+    if (adsetLaunchTab !== tab) {
+      console.log(`  [${tab}] Row ${r + 1} (CT${ct}): adset ${match.name} launched in ${adsetLaunchTab}, not ${tab} — skipping autofill here.`);
+      continue;
+    }
+    console.log(`  [${tab}] Row ${r + 1} (CT${ct}): auto-filling Ad Set ID = ${match.id} (${match.name})`);
     if (!DRY_RUN) {
-      await writeCell(SHEET_ID, `${MAY_TAB}!W${r + 1}`, match.id);
+      await writeCell(SHEET_ID, `${tab}!W${r + 1}`, match.id);
     }
     rows[r][idx.adsetId] = match.id; // also reflect in-memory for this run
   }
@@ -700,7 +718,8 @@ async function refreshMetricsBlock({ tabId, metrics, kill, dateRange, preFetched
 
 // ---------- Settled-metrics reconciliation pass ----------
 
-// For every PAUSED row on the May sheet within RECONCILE_WINDOW_DAYS of pause:
+// For every PAUSED row in the given month-tab snapshot within
+// RECONCILE_WINDOW_DAYS of pause:
 //   1. Re-fetch insights for that adset over its full run window.
 //   2. If spend (or any other metric) drifted upward vs what's in sheet col S,
 //      rewrite col S + refresh the doc's Metrics block on the matching tab.
@@ -709,7 +728,7 @@ async function refreshMetricsBlock({ tabId, metrics, kill, dateRange, preFetched
 // post-pause poll catches most of the drift, but residual ($1–$5) can keep
 // trickling in for hours. Running this every hourly tick converges within
 // 24h of pause.
-async function reconcileSettledMetrics(rows, header, idx, breakeven) {
+async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
   const todayIso = new Date().toISOString().slice(0, 10);
   // Fetch the doc tabs ONCE for the whole reconcile pass; refreshMetricsBlock
   // would otherwise re-fetch the entire ~36k-line doc for every paused row.
@@ -775,15 +794,15 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven) {
     const dateRange = `${formatDateMDY(launchDate)} – ${formatDateMDY(todayIso)}`;
     const resultsLine = buildResultsLine({ metrics: m, kill: verdict, dateRange });
     if (!DRY_RUN) {
-      await writeCell(SHEET_ID, `${MAY_TAB}!S${r + 1}`, resultsLine);
+      await writeCell(SHEET_ID, `${tab}!S${r + 1}`, resultsLine);
     }
 
     // Find the matching doc tab (title === adset name) and refresh metrics block.
-    const tab = preFetchedTabs ? findTabByTitle(preFetchedTabs, meta.name) : null;
-    if (tab && !DRY_RUN) {
+    const docTab = preFetchedTabs ? findTabByTitle(preFetchedTabs, meta.name) : null;
+    if (docTab && !DRY_RUN) {
       try {
         await refreshMetricsBlock({
-          tabId: tab.tabProperties.tabId,
+          tabId: docTab.tabProperties.tabId,
           metrics: m,
           kill: verdict,
           dateRange: `${dateRange} (${Math.max(1, Math.round(hours / 24))} days)`,
@@ -877,36 +896,62 @@ async function main() {
   const liveAdsets = await getActiveAdsets();
   console.log(`Found ${liveAdsets.length} ACTIVE adset(s) under ACTIVE campaigns.`);
 
-  // Snapshot the sheet for auto-fill + verdict mirroring + hypothesis + reconciliation.
-  const rows = await readRange(SHEET_ID, `${MAY_TAB}!A1:W500`);
-  const header = rows[0] ?? [];
-  const idx = {
-    test: header.indexOf('Creative Test #'),
-    launch: header.indexOf('Launch Date (double click)'),
-    status: header.indexOf('Status'),
-    results: header.indexOf('Results'),
-    hypothesis: header.findIndex((h) => String(h).includes("What's your hypothesis")),
-    adsetId: header.indexOf('Ad Set ID'),
-  };
-  if (idx.test < 0 || idx.status < 0 || idx.adsetId < 0) {
-    throw new Error(`Missing required column. Got indices: ${JSON.stringify(idx)}`);
+  // Discover which month tabs exist on the spreadsheet. We load every month
+  // tab the spreadsheet has (typically the past few months) so the bot can
+  // operate on rows from any of them — no more hardcoded 'May'.
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID, fields: 'sheets.properties.title' });
+  const existingTabTitles = new Set((meta.data.sheets ?? []).map((s) => s.properties?.title).filter(Boolean));
+  const monthTabs = MONTH_NAMES.filter((m) => existingTabTitles.has(m));
+  console.log(`Month tabs present: ${monthTabs.join(', ') || '(none)'}`);
+
+  // Snapshot each month tab. tabState[tab] = { rows, header, idx }.
+  const tabState = {};
+  for (const tab of monthTabs) {
+    const tRows = await readRange(SHEET_ID, `${tab}!A1:W500`);
+    const tHeader = tRows[0] ?? [];
+    const tIdx = {
+      test: tHeader.indexOf('Creative Test #'),
+      launch: tHeader.indexOf('Launch Date (double click)'),
+      status: tHeader.indexOf('Status'),
+      results: tHeader.indexOf('Results'),
+      hypothesis: tHeader.findIndex((h) => String(h).includes("What's your hypothesis")),
+      adsetId: tHeader.indexOf('Ad Set ID'),
+    };
+    if (tIdx.test < 0 || tIdx.adsetId < 0) {
+      console.log(`  · Skipping tab '${tab}' — missing required columns. idx=${JSON.stringify(tIdx)}`);
+      continue;
+    }
+    // Fall back to canonical positions if header lookup misses. Column R =
+    // Status (17), S = Results (18). Defensive — header text can rename.
+    if (tIdx.status < 0) tIdx.status = 17;
+    if (tIdx.results < 0) tIdx.results = 18;
+    tabState[tab] = { rows: tRows, header: tHeader, idx: tIdx };
   }
-  // Fall back to canonical positions if header lookup misses. Column R = Status (17),
-  // S = Results (18). Defensive — header text can rename.
-  if (idx.status < 0) idx.status = 17;
-  if (idx.results < 0) idx.results = 18;
 
   // Apply Bot Log column widths + alignment once per run (idempotent).
   if (!DRY_RUN) await ensureBotLogLayout();
 
-  // Auto-fill missing Ad Set IDs on the sheet by prefix-matching CT# → adset name.
-  await autofillAdSetIds(rows, header, idx, liveAdsets);
+  // Auto-fill missing Ad Set IDs across every month tab.
+  for (const tab of Object.keys(tabState)) {
+    const { rows, header, idx } = tabState[tab];
+    await autofillAdSetIds(rows, header, idx, liveAdsets, tab);
+  }
 
-  // Build map: Ad Set ID → row number (1-indexed) for sheet writeback.
+  // Build map: Ad Set ID → { tab, rowNum (1-indexed) } across all month tabs.
+  // If the same ID somehow lives in two tabs (manual paste error), the last
+  // tab in MONTH_NAMES order wins; warn so it gets cleaned up.
   const rowByAdset = new Map();
-  for (let r = 1; r < rows.length; r++) {
-    const id = String(rows[r]?.[idx.adsetId] ?? '').trim();
-    if (id) rowByAdset.set(id, r + 1);
+  for (const tab of Object.keys(tabState)) {
+    const { rows, idx } = tabState[tab];
+    for (let r = 1; r < rows.length; r++) {
+      const id = String(rows[r]?.[idx.adsetId] ?? '').trim();
+      if (!id) continue;
+      if (rowByAdset.has(id)) {
+        const prev = rowByAdset.get(id);
+        console.log(`  ! Ad Set ID ${id} appears on both '${prev.tab}' (row ${prev.rowNum}) and '${tab}' (row ${r + 1}). Using '${tab}'.`);
+      }
+      rowByAdset.set(id, { tab, rowNum: r + 1 });
+    }
   }
 
   let actionCount = 0;
@@ -946,9 +991,14 @@ async function main() {
     }
 
     // 2) Mirror PAUSED to sheet column R via USER_ENTERED writeCell.
-    const rowNum = rowByAdset.get(adset.id);
-    if (rowNum && !DRY_RUN) {
-      await writeCell(SHEET_ID, `${MAY_TAB}!R${rowNum}`, 'PAUSED');
+    //    Look up the row across all month tabs — adset's row lives on its
+    //    launch month's tab (e.g. June ads → June tab).
+    const rowRef = rowByAdset.get(adset.id);
+    if (!rowRef) {
+      console.log(`  ! Adset ${adset.id} not found on any month tab — sheet writes skipped.`);
+    }
+    if (rowRef && !DRY_RUN) {
+      await writeCell(SHEET_ID, `${rowRef.tab}!R${rowRef.rowNum}`, 'PAUSED');
     }
 
     // 3) Reconcile final-state metrics. Meta's insights ledger lags actual
@@ -987,9 +1037,9 @@ async function main() {
     // 5) Write a one-line Results summary to sheet column S. Mirrors the
     //    metrics block in the Learnings doc so the sheet is self-sufficient
     //    for quick scanning without opening the doc.
-    if (rowNum && !DRY_RUN) {
+    if (rowRef && !DRY_RUN) {
       const resultsLine = buildResultsLine({ metrics: m, kill: verdict, dateRange: `${formatDateMDY(launchDate)} – ${formatDateMDY(new Date().toISOString().slice(0, 10))}` });
-      await writeCell(SHEET_ID, `${MAY_TAB}!S${rowNum}`, resultsLine);
+      await writeCell(SHEET_ID, `${rowRef.tab}!S${rowRef.rowNum}`, resultsLine);
     }
 
     // 6) Build Learnings doc tab + Copy sub-tab, nested under the month parent.
@@ -997,9 +1047,14 @@ async function main() {
       try {
         const tabTitle = adset.name;
         const dateRange = `${formatDateMDY(launchDate)} – ${formatDateMDY(new Date().toISOString().slice(0, 10))} (${Math.max(1, Math.round(hours / 24))} days)`;
-        const oldHypothesis = rowNum && idx.hypothesis >= 0
-          ? String(rows[rowNum - 1]?.[idx.hypothesis] ?? '').trim()
-          : '';
+        // Pull hypothesis from the row's home tab snapshot (idx.hypothesis is
+        // per-tab now).
+        const oldHypothesis = (() => {
+          if (!rowRef) return '';
+          const state = tabState[rowRef.tab];
+          if (!state || state.idx.hypothesis < 0) return '';
+          return String(state.rows[rowRef.rowNum - 1]?.[state.idx.hypothesis] ?? '').trim();
+        })();
         const allTabs = await getAllTabs();
         const existing = findTabByTitle(allTabs, tabTitle);
         if (existing) {
@@ -1062,10 +1117,14 @@ async function main() {
   // Final pass: refresh metrics on already-paused adsets where Meta's billing
   // ledger has continued to settle since the original kill. Self-healing —
   // converges spend/CPC/CTR to true final-state numbers within ~24h of pause.
-  try {
-    await reconcileSettledMetrics(rows, header, idx, breakeven);
-  } catch (e) {
-    console.log(`! Settled-metrics reconciliation failed: ${e.message}`);
+  // Runs once per month tab against that tab's snapshot.
+  for (const tab of Object.keys(tabState)) {
+    const { rows, header, idx } = tabState[tab];
+    try {
+      await reconcileSettledMetrics(rows, header, idx, breakeven, tab);
+    } catch (e) {
+      console.log(`! Settled-metrics reconciliation failed for '${tab}': ${e.message}`);
+    }
   }
 
   await writeCell(SHEET_ID, 'Bot Control!B3', new Date().toISOString());

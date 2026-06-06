@@ -378,8 +378,24 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
     if (!ct) continue;
     if (existingId) {
       if (!adsetById.has(existingId)) {
-        // Sheet has an ID but Meta says it's not active. Could be paused legitimately —
-        // leave the cell alone but don't try to evaluate.
+        // Sheet has an ID but Meta says it's not in the ACTIVE set. Two cases:
+        //  (a) the adset was legitimately paused and never relaunched — leave
+        //      the cell alone (it's the correct historical ID).
+        //  (b) the test was RELAUNCHED under a new adset ID (e.g. a 6.4 CT26
+        //      duplicated to a 6.5 CT26). The sheet still points at the old,
+        //      now-dead ID, so rowByAdset can't map the live adset to this row
+        //      and the Learnings doc shows "(no hypothesis on sheet)". When a
+        //      live ACTIVE adset matches this row's CT# AND launched in this
+        //      tab's month, repoint W at the live ID so the row tracks the
+        //      adset that's actually running.
+        const relaunch = adsetsByCt.get(ct);
+        if (relaunch && tabNameForIso(relaunch.start_time) === tab) {
+          console.log(`  [${tab}] Row ${r + 1} (CT${ct}): stored Ad Set ID ${existingId} is not active; relaunch ${relaunch.id} (${relaunch.name}) found — repointing W.`);
+          if (!DRY_RUN) {
+            await writeCell(SHEET_ID, `${tab}!W${r + 1}`, relaunch.id);
+          }
+          rows[r][idx.adsetId] = relaunch.id; // reflect in-memory for this run
+        }
       }
       continue;
     }
@@ -1084,12 +1100,38 @@ async function main() {
         const tabTitle = adset.name;
         const dateRange = `${formatDateMDY(launchDate)} – ${formatDateMDY(new Date().toISOString().slice(0, 10))} (${Math.max(1, Math.round(hours / 24))} days)`;
         // Pull hypothesis from the row's home tab snapshot (idx.hypothesis is
-        // per-tab now).
+        // per-tab now). If the Ad Set ID lookup missed (rowRef null — e.g. a
+        // relaunched adset whose new ID wasn't repointed into col W), fall back
+        // to matching by CT# parsed from the adset name so the doc still gets
+        // the real hypothesis instead of "(no hypothesis on sheet)". Prefer the
+        // adset's launch-month tab, then any tab.
         const oldHypothesis = (() => {
-          if (!rowRef) return '';
-          const state = tabState[rowRef.tab];
-          if (!state || state.idx.hypothesis < 0) return '';
-          return String(state.rows[rowRef.rowNum - 1]?.[state.idx.hypothesis] ?? '').trim();
+          const readFromRef = (ref) => {
+            if (!ref) return '';
+            const state = tabState[ref.tab];
+            if (!state || state.idx.hypothesis < 0) return '';
+            return String(state.rows[ref.rowNum - 1]?.[state.idx.hypothesis] ?? '').trim();
+          };
+          const direct = readFromRef(rowRef);
+          if (direct) return direct;
+          const ct = ctNumberFromTitle(adset.name);
+          if (ct == null) return '';
+          const launchTab = tabNameForIso(adset.start_time);
+          const tabOrder = [launchTab, ...Object.keys(tabState).filter((t) => t !== launchTab)];
+          for (const tab of tabOrder) {
+            const state = tabState[tab];
+            if (!state || state.idx.hypothesis < 0 || state.idx.test < 0) continue;
+            for (let r = 1; r < state.rows.length; r++) {
+              if (String(state.rows[r]?.[state.idx.test] ?? '').trim() === String(ct)) {
+                const h = String(state.rows[r]?.[state.idx.hypothesis] ?? '').trim();
+                if (h) {
+                  console.log(`  · Hypothesis: ID lookup missed for ${adset.name}; matched by CT${ct} on '${tab}' row ${r + 1}.`);
+                  return h;
+                }
+              }
+            }
+          }
+          return '';
         })();
         const allTabs = await getAllTabs();
         const existing = findTabByTitle(allTabs, tabTitle);

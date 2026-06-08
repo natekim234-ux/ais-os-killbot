@@ -168,10 +168,10 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
   const linkClicks = sumAction(d.actions, ['link_click']);
   const ctrLink = impressions > 0 ? (linkClicks / impressions) * 100 : null;
   const cpcOutbound = pickCost(d.cost_per_outbound_click, ['outbound_click']);
-  const atc = sumAction(d.actions, ['offsite_conversion.fb_pixel_add_to_cart', 'add_to_cart']);
-  const purchases = sumAction(d.actions, ['offsite_conversion.fb_pixel_purchase', 'purchase']);
-  const cpp = pickCost(d.cost_per_action_type, ['offsite_conversion.fb_pixel_purchase', 'purchase']);
-  const revenue = sumActionValue(d.action_values, ['offsite_conversion.fb_pixel_purchase', 'purchase']);
+  const atc = pickAction(d.actions, ['add_to_cart', 'offsite_conversion.fb_pixel_add_to_cart']);
+  const purchases = pickAction(d.actions, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
+  const cpp = pickCost(d.cost_per_action_type, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
+  const revenue = pickActionValue(d.action_values, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
   const roas = spend > 0 ? revenue / spend : 0;
   return {
     spend,
@@ -244,6 +244,27 @@ function sumAction(actions, types) {
   return actions
     .filter((a) => types.includes(a.action_type))
     .reduce((s, a) => s + Number(a.value ?? 0), 0);
+}
+
+// Meta deduplicates conversions across action_type aliases (e.g. `purchase` and
+// `offsite_conversion.fb_pixel_purchase` both report the same count). Summing
+// all matching keys double-counts. Use the first match in priority order instead.
+function pickAction(actions, types) {
+  if (!Array.isArray(actions)) return 0;
+  for (const type of types) {
+    const hit = actions.find((a) => a.action_type === type);
+    if (hit != null) return Number(hit.value ?? 0);
+  }
+  return 0;
+}
+
+function pickActionValue(values, types) {
+  if (!Array.isArray(values)) return 0;
+  for (const type of types) {
+    const hit = values.find((a) => a.action_type === type);
+    if (hit != null) return Number(hit.value ?? 0);
+  }
+  return 0;
 }
 
 function sumActionValue(values, types) {

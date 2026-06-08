@@ -491,18 +491,23 @@ function parseHypothesisItems(hypothesis) {
     .filter(Boolean);
 }
 
-// Build the Learnings body as plain text. Only "Metrics" is bolded.
-// Old Hypothesis items are inserted as plain text here; numbered-list
-// formatting is applied separately via createParagraphBullets after insertion.
+// Build the Learnings body text and all bold/list metadata.
+//
+// Formatting spec:
+//   Bold entire line : "Metrics", "Result: Loser", "Killed by Rule X — ..."
+//   Bold label only  : "Old Hypothesis:", "Learnings:", "New Hypothesis:"
+//   No blank line between "Learnings:" and learnings content
+//   No blank line between "New Hypothesis:" and new hypothesis content
+//   Old Hypothesis items → Google Docs numbered list (NUMBERED_DECIMAL_ALPHA_ROMAN)
 function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
   const safe = (n, prefix = '', decimals = 2) =>
     n == null || Number.isNaN(n) ? '—' : `${prefix}${Number(n).toFixed(decimals)}`;
 
   const hypItems = parseHypothesisItems(oldHypothesis);
-  // Each hypothesis item gets its own line; we'll apply numbered list style later.
   const hypLines = hypItems.length > 0 ? hypItems : ['(no hypothesis on sheet)'];
 
-  const beforeHyp = [
+  // No blank line after Learnings: or New Hypothesis:
+  const lines = [
     'Metrics',
     `Date Range: ${dateRange}`,
     `Amount Spent: ${safe(metrics.spend, '$')}`,
@@ -519,53 +524,82 @@ function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
     `Killed by ${kill.rule} — ${kill.reason}`,
     '',
     'Old Hypothesis:',
-  ];
-
-  const afterHyp = [
+    ...hypLines,
     '',
     'Learnings:',
+    // no blank line here — Nate's learnings go directly below
     '',
     'New Hypothesis:',
+    // no blank line here — Nate's new hypothesis goes directly below
     '',
   ];
 
-  const text = [...beforeHyp, ...hypLines, ...afterHyp].join('\n') + '\n';
+  const text = lines.join('\n') + '\n';
 
-  // Locate index range of hypothesis lines for numbered-list styling.
-  // cursor starts at 1 (Docs API tab body offset).
+  // Compute bold ranges and hypothesis list range.
+  // Docs API: tab body starts at index 1.
+  const boldRanges = [];
   let cursor = 1;
-  for (const line of beforeHyp) { cursor += line.length + 1; }
-  const hypStart = cursor;
-  for (const line of hypLines) { cursor += line.length + 1; }
-  const hypEnd = cursor - 1; // end of last hyp line, before trailing \n
+  let hypStart = -1;
+  let hypEnd = -1;
+  let inHypItems = false;
 
-  // Bold range: only "Metrics" header.
-  const metricsLine = 'Metrics';
-  const boldRanges = [{ startIndex: 1, endIndex: 1 + metricsLine.length }];
+  // Labels whose ENTIRE line gets bolded
+  const boldFullLine = new Set(['Metrics', 'Result: Loser']);
+  // Labels where only the label text (not subsequent content) is bolded
+  const boldLabelOnly = new Set(['Old Hypothesis:', 'Learnings:', 'New Hypothesis:']);
+  // The Killed by line is identified by prefix
+  const killedLine = `Killed by ${kill.rule} — ${kill.reason}`;
 
-  return { text, boldRanges, hypStart, hypEnd, hypCount: hypLines.length, useNumberedList: hypItems.length > 0 };
+  for (const line of lines) {
+    const start = cursor;
+    const end = cursor + line.length;
+
+    if (boldFullLine.has(line) || line === killedLine) {
+      if (line.length > 0) boldRanges.push({ startIndex: start, endIndex: end });
+    } else if (boldLabelOnly.has(line)) {
+      if (line.length > 0) boldRanges.push({ startIndex: start, endIndex: end });
+      // Mark where hyp items start (right after "Old Hypothesis:" line's \n)
+      if (line === 'Old Hypothesis:') {
+        inHypItems = true;
+        hypStart = end + 1; // +1 for the \n
+      }
+    } else if (inHypItems) {
+      if (line === '') {
+        // blank line ends the hyp items block
+        hypEnd = start - 1; // end of last hyp item (before this \n)
+        inHypItems = false;
+      }
+    }
+
+    cursor = end + 1; // +1 for the \n after each line
+  }
+
+  const useNumberedList = hypItems.length > 0 && hypStart > 0 && hypEnd > hypStart;
+
+  return { text, boldRanges, hypStart, hypEnd, useNumberedList };
 }
 
-// Write the Learnings tab body, bold "Metrics", then apply numbered list to hypothesis.
+// Write the Learnings tab body with correct bold and numbered list formatting.
 async function writeLearningsTab({ tabId, text, boldRanges, hypStart, hypEnd, useNumberedList }) {
+  // Insert text + apply all bold in one call
   const requests = [
     { insertText: { location: { index: 1, tabId }, text } },
-    {
+    ...boldRanges.map((r) => ({
       updateTextStyle: {
-        range: { startIndex: boldRanges[0].startIndex, endIndex: boldRanges[0].endIndex, tabId },
+        range: { startIndex: r.startIndex, endIndex: r.endIndex, tabId },
         textStyle: { bold: true },
         fields: 'bold',
       },
-    },
+    })),
   ];
   await docs.documents.batchUpdate({
     documentId: LEARNINGS_DOC_ID,
     requestBody: { requests },
   });
 
-  // Apply Google Docs numbered list to hypothesis items in a second call.
-  // NUMBERED_DECIMAL_ALPHA_ROMAN gives "1. 2. 3." indented list style.
-  if (useNumberedList && hypEnd > hypStart) {
+  // Apply numbered list to Old Hypothesis items in a second call.
+  if (useNumberedList) {
     await docs.documents.batchUpdate({
       documentId: LEARNINGS_DOC_ID,
       requestBody: {

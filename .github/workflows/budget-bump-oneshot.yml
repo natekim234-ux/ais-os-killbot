@@ -1,0 +1,31 @@
+name: Hushlab Budget Bump (one-shot 6/9)
+
+# Fires once at 09:00 UTC = 5:00 AM EDT on Tue Jun 9 2026.
+# Self-disables after: the date fields (9 June) mean cron only matches that one day.
+# Safe to leave in repo — it will not match again until June 9 of a future year, and
+# Nate will delete/disable it after confirming the run.
+on:
+  schedule:
+    - cron: '0 9 9 6 *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true = report only (no budget change); false = apply'
+        required: false
+        default: 'true'
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run one-shot budget bump
+        run: node budget-bump-oneshot.mjs
+        env:
+          # Scheduled runs apply for real (false); manual dispatch defaults to dry-run.
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (github.event.inputs.dry_run || 'true') }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}

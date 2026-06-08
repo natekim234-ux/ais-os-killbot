@@ -639,42 +639,8 @@ async function ensureMonthTab(launchDateIso) {
   return { tabId: newId, monthName, allTabs: await getAllTabs() };
 }
 
-// Reorder a freshly created tab into CT-numeric order among its month siblings.
-// Walks all children of the month tab, sorts them by CT# (no-CT entries sort to
-// the end), and re-issues updateTabProperties with the corrected index.
-async function reorderMonthTabChildren(monthTabId) {
-  const allTabs = await getAllTabs();
-  const monthTab = (function find(tabs) {
-    for (const t of tabs) {
-      if (t.tabProperties?.tabId === monthTabId) return t;
-      const r = find(t.childTabs ?? []);
-      if (r) return r;
-    }
-    return null;
-  })(allTabs);
-  if (!monthTab) return;
-  const children = [...(monthTab.childTabs ?? [])];
-  // Sort: CT# ascending, no-CT to the end (stable by current index).
-  children.sort((a, b) => {
-    const an = ctNumberFromTitle(a.tabProperties?.title);
-    const bn = ctNumberFromTitle(b.tabProperties?.title);
-    if (an == null && bn == null) return (a.tabProperties?.index ?? 0) - (b.tabProperties?.index ?? 0);
-    if (an == null) return 1;
-    if (bn == null) return -1;
-    return an - bn;
-  });
-  const requests = children.map((t, i) => ({
-    updateTabProperties: {
-      tabProperties: { tabId: t.tabProperties.tabId, index: i },
-      fields: 'index',
-    },
-  }));
-  if (requests.length === 0) return;
-  await docs.documents.batchUpdate({
-    documentId: LEARNINGS_DOC_ID,
-    requestBody: { requests },
-  });
-}
+// Note: the Google Docs API does not support programmatic tab reordering.
+// Tab order must be adjusted manually by dragging tabs in the document.
 
 // ---------- Doc: in-place Metrics block update on an existing tab ----------
 
@@ -844,9 +810,12 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
       console.log(`  · Reconcile: ${meta.name}: insights fetch failed — ${e.message}`);
       continue;
     }
+    // Skip only when we successfully parsed a prior spend AND it hasn't moved.
+    // If prevSpend is null (parse miss), always rewrite — safer than silently skipping.
     if (prevSpend != null && m.spend <= prevSpend + 0.005) continue; // no drift
 
-    console.log(`  · Reconcile: ${meta.name} — spend $${(prevSpend ?? 0).toFixed(2)} → $${m.spend.toFixed(2)}`);
+    const prevLabel = prevSpend != null ? `$${prevSpend.toFixed(2)}` : '(unknown)';
+    console.log(`  · Reconcile: ${meta.name} — spend ${prevLabel} → $${m.spend.toFixed(2)}`);
 
     m.pctSpend7d = await fetchPctOfCampaignSpend7d(adsetId, meta.campaign?.id);
 
@@ -1021,23 +990,9 @@ async function main() {
   // Apply Bot Log column widths + alignment once per run (idempotent).
   if (!DRY_RUN) await ensureBotLogLayout();
 
-  // Re-sort ALL existing month-tab children in the Learnings doc into CT# order.
-  // Runs every tick so a tab added out-of-order (e.g. CT29 before CT28) gets
-  // corrected on the next run without manual intervention.
-  if (!DRY_RUN) {
-    try {
-      const allDocTabs = await getAllTabs();
-      for (const t of allDocTabs) {
-        const title = t.tabProperties?.title ?? '';
-        if (MONTH_NAMES.includes(title)) {
-          await reorderMonthTabChildren(t.tabProperties.tabId);
-          console.log(`  ✓ Re-sorted doc children under "${title}"`);
-        }
-      }
-    } catch (e) {
-      console.log(`  ! Doc tab reorder failed: ${e.message}`);
-    }
-  }
+  // Note: Google Docs API does not support programmatic tab reordering
+  // (updateTabProperties is a Sheets-only concept). Tab order in the Learnings
+  // doc must be adjusted manually by dragging tabs if they land out of order.
 
   // Auto-fill missing Ad Set IDs across every month tab.
   for (const tab of Object.keys(tabState)) {
@@ -1213,12 +1168,7 @@ async function main() {
           if (wrote) console.log(`  ✓ Copy sub-tab created: "Copy | ${tabTitle}"`);
           else console.log(`  · No ad copy found for ${adset.id} — no Copy sub-tab.`);
 
-          // Reorder siblings under the month so CT16 sits before CT17, etc.
-          try {
-            await reorderMonthTabChildren(monthTabId);
-          } catch (e) {
-            console.log(`  ! Reorder under "${monthName}" failed: ${e.message}`);
-          }
+          // Note: Docs API does not support tab reordering. Drag tabs manually if needed.
         }
       } catch (e) {
         console.log(`  ! Learnings doc write failed: ${e.message}`);

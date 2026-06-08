@@ -478,17 +478,31 @@ async function createTab(title, parentTabId) {
   return newTabId;
 }
 
-// Build the Learnings body as plain text AND the bold-range list so we can
-// style it after insertion. Bold spans we want:
-//   - "Metrics" header
-//   - "Result: Loser" (entire line)
-//   - "Killed by Rule N — ..." (entire line)
-//   - "Old Hypothesis:", "Learnings:", "New Hypothesis:" labels
+// Parse a hypothesis string that may contain numbered items ("1. text\n2. text")
+// into an array of plain strings (without the leading "N. "). Single-item or
+// un-numbered hypotheses come back as a one-element array.
+function parseHypothesisItems(hypothesis) {
+  if (!hypothesis) return [];
+  const numbered = hypothesis.match(/^\d+\.\s+/m);
+  if (!numbered) return [hypothesis.trim()];
+  return hypothesis
+    .split(/\n/)
+    .map((l) => l.replace(/^\d+\.\s+/, '').trim())
+    .filter(Boolean);
+}
+
+// Build the Learnings body as plain text. Only "Metrics" is bolded.
+// Old Hypothesis items are inserted as plain text here; numbered-list
+// formatting is applied separately via createParagraphBullets after insertion.
 function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
   const safe = (n, prefix = '', decimals = 2) =>
     n == null || Number.isNaN(n) ? '—' : `${prefix}${Number(n).toFixed(decimals)}`;
 
-  const lines = [
+  const hypItems = parseHypothesisItems(oldHypothesis);
+  // Each hypothesis item gets its own line; we'll apply numbered list style later.
+  const hypLines = hypItems.length > 0 ? hypItems : ['(no hypothesis on sheet)'];
+
+  const beforeHyp = [
     'Metrics',
     `Date Range: ${dateRange}`,
     `Amount Spent: ${safe(metrics.spend, '$')}`,
@@ -505,7 +519,9 @@ function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
     `Killed by ${kill.rule} — ${kill.reason}`,
     '',
     'Old Hypothesis:',
-    oldHypothesis || '(no hypothesis on sheet)',
+  ];
+
+  const afterHyp = [
     '',
     'Learnings:',
     '',
@@ -513,55 +529,55 @@ function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
     '',
   ];
 
-  // Compute Docs-API indices for each line. Tab body starts at index 1 (the
-  // tab's content begins after a hidden section break). After we insert
-  // body+'\n', each line ends with a newline; we walk line-by-line tracking
-  // the cursor position.
-  const boldTargets = new Set([
-    'Metrics',
-    'Result: Loser',
-    'Old Hypothesis:',
-    'Learnings:',
-    'New Hypothesis:',
-  ]);
+  const text = [...beforeHyp, ...hypLines, ...afterHyp].join('\n') + '\n';
 
-  const text = lines.join('\n') + '\n';
-  const boldRanges = [];
-  let cursor = 1; // Docs API: empty tab body starts insertable at index 1.
-  for (const line of lines) {
-    const start = cursor;
-    const end = cursor + line.length;
-    if (
-      boldTargets.has(line) ||
-      line.startsWith('Killed by Rule ')
-    ) {
-      if (line.length > 0) boldRanges.push({ startIndex: start, endIndex: end });
-    }
-    cursor = end + 1; // +1 for the newline character that follows
-  }
+  // Locate index range of hypothesis lines for numbered-list styling.
+  // cursor starts at 1 (Docs API tab body offset).
+  let cursor = 1;
+  for (const line of beforeHyp) { cursor += line.length + 1; }
+  const hypStart = cursor;
+  for (const line of hypLines) { cursor += line.length + 1; }
+  const hypEnd = cursor - 1; // end of last hyp line, before trailing \n
 
-  return { text, boldRanges };
+  // Bold range: only "Metrics" header.
+  const metricsLine = 'Metrics';
+  const boldRanges = [{ startIndex: 1, endIndex: 1 + metricsLine.length }];
+
+  return { text, boldRanges, hypStart, hypEnd, hypCount: hypLines.length, useNumberedList: hypItems.length > 0 };
 }
 
-// Write the Learnings tab body + apply bold styling in a single batchUpdate
-// so the indices we computed against `text` line up exactly.
-async function writeLearningsTab({ tabId, text, boldRanges }) {
+// Write the Learnings tab body, bold "Metrics", then apply numbered list to hypothesis.
+async function writeLearningsTab({ tabId, text, boldRanges, hypStart, hypEnd, useNumberedList }) {
   const requests = [
     { insertText: { location: { index: 1, tabId }, text } },
-  ];
-  for (const r of boldRanges) {
-    requests.push({
+    {
       updateTextStyle: {
-        range: { startIndex: r.startIndex, endIndex: r.endIndex, tabId },
+        range: { startIndex: boldRanges[0].startIndex, endIndex: boldRanges[0].endIndex, tabId },
         textStyle: { bold: true },
         fields: 'bold',
       },
-    });
-  }
+    },
+  ];
   await docs.documents.batchUpdate({
     documentId: LEARNINGS_DOC_ID,
     requestBody: { requests },
   });
+
+  // Apply Google Docs numbered list to hypothesis items in a second call.
+  // NUMBERED_DECIMAL_ALPHA_ROMAN gives "1. 2. 3." indented list style.
+  if (useNumberedList && hypEnd > hypStart) {
+    await docs.documents.batchUpdate({
+      documentId: LEARNINGS_DOC_ID,
+      requestBody: {
+        requests: [{
+          createParagraphBullets: {
+            range: { startIndex: hypStart, endIndex: hypEnd, tabId },
+            bulletPreset: 'NUMBERED_DECIMAL_ALPHA_ROMAN',
+          },
+        }],
+      },
+    });
+  }
 }
 
 // Build a one-line summary for sheet column S (Results). Mirrors the doc's
@@ -793,8 +809,9 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
     if (!adsetId) continue;
     const existingResults = String(rows[r]?.[idx.results] ?? '').trim();
     if (!existingResults) continue; // only reconcile rows the bot wrote
-    // Existing spend from col S, parsed defensively (allow either "Spend $19.40" or "Spend $19.40.").
-    const prevSpendMatch = existingResults.match(/Spend \$([\d.]+)/);
+    // Existing spend from col S. Format is "Spend $19.40" or "Spend $19.40." or
+    // "Amount Spent: $19.40" (doc refresh path). Accept either prefix.
+    const prevSpendMatch = existingResults.match(/(?:Spend|Amount Spent:?)\s*\$([\d.]+)/);
     const prevSpend = prevSpendMatch ? Number(prevSpendMatch[1]) : null;
 
     // Pull start_time + name so we know the run window and which doc tab to update.
@@ -1003,6 +1020,24 @@ async function main() {
 
   // Apply Bot Log column widths + alignment once per run (idempotent).
   if (!DRY_RUN) await ensureBotLogLayout();
+
+  // Re-sort ALL existing month-tab children in the Learnings doc into CT# order.
+  // Runs every tick so a tab added out-of-order (e.g. CT29 before CT28) gets
+  // corrected on the next run without manual intervention.
+  if (!DRY_RUN) {
+    try {
+      const allDocTabs = await getAllTabs();
+      for (const t of allDocTabs) {
+        const title = t.tabProperties?.title ?? '';
+        if (MONTH_NAMES.includes(title)) {
+          await reorderMonthTabChildren(t.tabProperties.tabId);
+          console.log(`  ✓ Re-sorted doc children under "${title}"`);
+        }
+      }
+    } catch (e) {
+      console.log(`  ! Doc tab reorder failed: ${e.message}`);
+    }
+  }
 
   // Auto-fill missing Ad Set IDs across every month tab.
   for (const tab of Object.keys(tabState)) {

@@ -483,11 +483,13 @@ async function createTab(title, parentTabId) {
 // un-numbered hypotheses come back as a one-element array.
 function parseHypothesisItems(hypothesis) {
   if (!hypothesis) return [];
-  const numbered = hypothesis.match(/^\d+\.\s+/m);
-  if (!numbered) return [hypothesis.trim()];
+  // Always split on newlines so each sentence becomes its own list item — the
+  // sheet stores the "I think..." sentences one per line, usually WITHOUT a
+  // leading "1." digit. Strip any leading numbering if present so we never
+  // double-number once createParagraphBullets renders native 1. 2. 3.
   return hypothesis
-    .split(/\n/)
-    .map((l) => l.replace(/^\d+\.\s+/, '').trim())
+    .split(/\n+/)
+    .map((l) => l.replace(/^\d+[.)]\s+/, '').trim())
     .filter(Boolean);
 }
 
@@ -582,9 +584,21 @@ function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
 
 // Write the Learnings tab body with correct bold and numbered list formatting.
 async function writeLearningsTab({ tabId, text, boldRanges, hypStart, hypEnd, useNumberedList }) {
-  // Insert text + apply all bold in one call
+  // Insert text + apply all bold in one call.
+  // FIRST force the whole inserted span to bold:false — inserting at index 1
+  // inherits the insertion-point text style, so without this clear the entire
+  // block renders bold and the per-line bold:true below only re-affirms it
+  // (the bug seen on CT27–CT32 and all June tabs). Targeted bold:true then
+  // re-bolds only the header/result/killed-by/label lines.
   const requests = [
     { insertText: { location: { index: 1, tabId }, text } },
+    {
+      updateTextStyle: {
+        range: { startIndex: 1, endIndex: 1 + text.length, tabId },
+        textStyle: { bold: false },
+        fields: 'bold',
+      },
+    },
     ...boldRanges.map((r) => ({
       updateTextStyle: {
         range: { startIndex: r.startIndex, endIndex: r.endIndex, tabId },
@@ -767,6 +781,15 @@ async function refreshMetricsBlock({ tabId, metrics, kill, dateRange, preFetched
   const requests = [
     { deleteContentRange: { range: { startIndex: replaceStart, endIndex: replaceEnd, tabId } } },
     { insertText: { location: { index: replaceStart, tabId }, text: newText } },
+    // Clear bold across the whole re-inserted block first so it can't inherit a
+    // stray bold run from the insertion point; targeted bold:true re-applies.
+    {
+      updateTextStyle: {
+        range: { startIndex: replaceStart, endIndex: replaceStart + newText.length, tabId },
+        textStyle: { bold: false },
+        fields: 'bold',
+      },
+    },
   ];
   for (const r of boldRanges) {
     requests.push({

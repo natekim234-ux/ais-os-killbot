@@ -687,8 +687,51 @@ async function ensureMonthTab(launchDateIso) {
   return { tabId: newId, monthName, allTabs: await getAllTabs() };
 }
 
-// Note: the Google Docs API does not support programmatic tab reordering.
-// Tab order must be adjusted manually by dragging tabs in the document.
+// Re-sort a month tab's children in ascending CT-number order. The Docs API
+// request for this is `updateDocumentTabProperties` (NOT `updateTabProperties`
+// — an earlier attempt used the wrong name, got a schema error, and the
+// feature was removed as "unsupported"). `index` is sibling-relative.
+//
+// Requests inside one batchUpdate apply sequentially, so we assign desired
+// positions in ascending order: once position 0..i-1 are placed, setting the
+// next tab to index i never disturbs the already-correct prefix.
+async function reorderMonthTabChildren(monthTabId) {
+  const allTabs = await getAllTabs();
+  const month = (function find(tabs) {
+    for (const t of tabs ?? []) {
+      if (t.tabProperties?.tabId === monthTabId) return t;
+      const r = find(t.childTabs);
+      if (r) return r;
+    }
+    return null;
+  })(allTabs);
+  if (!month) return false;
+  const children = (month.childTabs ?? []).map((t) => t.tabProperties);
+  const sorted = [...children].sort((a, b) => {
+    const ca = ctNumberFromTitle(a.title);
+    const cb = ctNumberFromTitle(b.title);
+    // Non-CT tabs keep their relative position, sorted ahead of CT tabs.
+    if (ca == null && cb == null) return (a.index ?? 0) - (b.index ?? 0);
+    if (ca == null) return -1;
+    if (cb == null) return 1;
+    return ca - cb;
+  });
+  if (sorted.every((tp, i) => tp.index === i)) return false; // already in order
+  // Emit a request for every position (not just "moved" ones): earlier moves
+  // shift sibling indices, so the snapshot's per-tab index goes stale mid-batch
+  // and a skip based on it can leave a tab out of place. No-op sets are cheap.
+  const requests = sorted.map((tp, i) => ({
+    updateDocumentTabProperties: {
+      tabProperties: { tabId: tp.tabId, index: i },
+      fields: 'index',
+    },
+  }));
+  await docs.documents.batchUpdate({
+    documentId: LEARNINGS_DOC_ID,
+    requestBody: { requests },
+  });
+  return true;
+}
 
 // ---------- Doc: in-place Metrics block update on an existing tab ----------
 
@@ -878,15 +921,20 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
 
     // Re-derive the kill verdict using the latest numbers. We do NOT re-pause
     // (already paused) — verdict is just used to rebuild the "Killed by …" line.
-    // Recompute hoursSinceAdsetStart at the kill TIME, not now: parse the prior
-    // results line's "Ran <dateRange>" to keep the original duration on-record.
-    const hours = (new Date() - new Date(startTime)) / 36e5;
+    // Keep the duration AT KILL TIME on-record: parse the prior results line's
+    // "after X.Xh" and "Ran A – B" rather than recomputing from now(), which
+    // would silently inflate the run duration on every reconcile tick.
+    const prevHours = existingResults.match(/after ([\d.]+)h/);
+    const hours = prevHours ? Number(prevHours[1]) : (new Date() - new Date(startTime)) / 36e5;
     const verdict = evaluate(m, hours, breakeven) ?? {
       rule: 'Rule (post-pause)',
       reason: `Reconciled spend $${m.spend.toFixed(2)}`,
     };
 
-    const dateRange = `${formatDateMDY(launchDate)} – ${formatDateMDY(todayIso)}`;
+    const prevRan = existingResults.match(/Ran ([\d/]+) – ([\d/]+)/);
+    const dateRange = prevRan
+      ? `${prevRan[1]} – ${prevRan[2]}`
+      : `${formatDateMDY(launchDate)} – ${formatDateMDY(todayIso)}`;
     const resultsLine = buildResultsLine({ metrics: m, kill: verdict, dateRange });
     if (!DRY_RUN) {
       await writeCell(SHEET_ID, `${tab}!S${r + 1}`, resultsLine);
@@ -900,7 +948,14 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
           tabId: docTab.tabProperties.tabId,
           metrics: m,
           kill: verdict,
-          dateRange: `${dateRange} (${Math.max(1, Math.round(hours / 24))} days)`,
+          // Days from the preserved (kill-time) date range when we have it —
+          // hours-from-now would inflate the run length for Rule 1/3 kills,
+          // whose reasons carry no "after X.Xh" to parse hours back from.
+          dateRange: `${dateRange} (${
+            prevRan
+              ? Math.max(1, Math.round((new Date(prevRan[2]) - new Date(prevRan[1])) / 86400000))
+              : Math.max(1, Math.round(hours / 24))
+          } days)`,
           preFetchedTabs,
         });
         console.log(`  ✓ Doc Metrics block refreshed: "${meta.name}"`);
@@ -1047,10 +1102,6 @@ async function main() {
   // Apply Bot Log column widths + alignment once per run (idempotent).
   if (!DRY_RUN) await ensureBotLogLayout();
 
-  // Note: Google Docs API does not support programmatic tab reordering
-  // (updateTabProperties is a Sheets-only concept). Tab order in the Learnings
-  // doc must be adjusted manually by dragging tabs if they land out of order.
-
   // Auto-fill missing Ad Set IDs across every month tab.
   for (const tab of Object.keys(tabState)) {
     const { rows, header, idx } = tabState[tab];
@@ -1075,6 +1126,12 @@ async function main() {
   }
 
   let actionCount = 0;
+  // Evaluate in ascending CT order so that when several adsets die in the same
+  // tick, their Learnings tabs are CREATED lowest-CT-first (CT34 was processed
+  // before CT33 on 2026-06-11 because Meta returns adsets newest-first).
+  liveAdsets.sort(
+    (a, b) => (ctNumberFromTitle(a.name) ?? Infinity) - (ctNumberFromTitle(b.name) ?? Infinity),
+  );
   for (const adset of liveAdsets) {
     const launchDate = dateFromIso(adset.start_time);
     const launchAt = new Date(adset.start_time);
@@ -1210,13 +1267,18 @@ async function main() {
           // month tab when the calendar rolls over. Nest the CT tab inside it.
           const { tabId: monthTabId, monthName } = await ensureMonthTab(launchDate);
           const tabId = await createTab(tabTitle, monthTabId);
-          const { text, boldRanges } = buildLearningsTemplate({
+          // Pass the WHOLE template through — writeLearningsTab needs
+          // hypStart/hypEnd/useNumberedList to render the Old Hypothesis as a
+          // native numbered list. Destructuring only {text, boldRanges} here
+          // silently dropped those fields and the list never got applied
+          // (the CT33/CT34 plain-text hypothesis bug, 2026-06-11).
+          const tpl = buildLearningsTemplate({
             dateRange,
             metrics: m,
             oldHypothesis,
             kill: verdict,
           });
-          await writeLearningsTab({ tabId, text, boldRanges });
+          await writeLearningsTab({ tabId, ...tpl });
           console.log(`  ✓ Learnings doc tab created under "${monthName}": "${tabTitle}"`);
 
           // Pull ad copy and create Copy sub-tab as a child of the new CT tab.
@@ -1225,7 +1287,15 @@ async function main() {
           if (wrote) console.log(`  ✓ Copy sub-tab created: "Copy | ${tabTitle}"`);
           else console.log(`  · No ad copy found for ${adset.id} — no Copy sub-tab.`);
 
-          // Note: Docs API does not support tab reordering. Drag tabs manually if needed.
+          // Keep the month's CT tabs sorted lowest→highest CT number.
+          // addDocumentTab always appends, so a kill that arrives out of CT
+          // order (or several kills in one tick) lands wrong without this.
+          try {
+            const moved = await reorderMonthTabChildren(monthTabId);
+            if (moved) console.log(`  ✓ "${monthName}" tabs re-sorted by CT number`);
+          } catch (e) {
+            console.log(`  ! Tab reorder failed: ${e.message}`);
+          }
         }
       } catch (e) {
         console.log(`  ! Learnings doc write failed: ${e.message}`);

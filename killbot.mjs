@@ -920,6 +920,14 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
     console.log(`  · Reconcile: ${meta.name} — spend ${prevLabel} → $${m.spend.toFixed(2)}`);
 
     m.pctSpend7d = await fetchPctOfCampaignSpend7d(adsetId, meta.campaign?.id);
+    // When the adset's whole run fits inside the 7d window and it spent money,
+    // a 0%/null here is provably wrong — Meta transiently returns an empty
+    // insights row sometimes (wrote a false 0.0% on CT33, 2026-06-11). Fall
+    // back to the prior recorded value from col S instead of writing the lie.
+    if (!m.pctSpend7d && m.spend > 0 && daysSinceStart <= 7) {
+      const prevPct = existingResults.match(/% of Spend \(7d\) ([\d.]+)%/);
+      if (prevPct) m.pctSpend7d = Number(prevPct[1]);
+    }
 
     // Re-derive the kill verdict using the latest numbers. We do NOT re-pause
     // (already paused) — verdict is just used to rebuild the "Killed by …" line.

@@ -877,7 +877,9 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
     if (!existingResults) continue; // only reconcile rows the bot wrote
     // Existing spend from col S. Format is "Spend $19.40" or "Spend $19.40." or
     // "Amount Spent: $19.40" (doc refresh path). Accept either prefix.
-    const prevSpendMatch = existingResults.match(/(?:Spend|Amount Spent:?)\s*\$([\d.]+)/);
+    // Don't let [\d.]+ swallow the sentence period — "Spend $34.00. ROAS"
+    // captured "34.00." → Number() = NaN → every row rewrote on every tick.
+    const prevSpendMatch = existingResults.match(/(?:Spend|Amount Spent:?)\s*\$(\d+(?:\.\d+)?)/);
     const prevSpend = prevSpendMatch ? Number(prevSpendMatch[1]) : null;
 
     // Pull start_time + name so we know the run window and which doc tab to update.

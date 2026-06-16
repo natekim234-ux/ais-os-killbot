@@ -1,0 +1,53 @@
+name: Killbot Heartbeat
+
+# Self-perpetuating 15-min trigger for the Hushlab Killbot.
+#
+# WHY THIS EXISTS: GitHub's native `schedule:` cron is best-effort and was firing
+# the killbot only every 2-5 HOURS (CT41 drifted $9.54 -> $53.56 in one 4h41m
+# gap, 2026-06-16). This workflow instead re-arms ITSELF: each run dispatches the
+# killbot, sleeps ~14 min, then dispatches itself again. Because every run is a
+# `workflow_dispatch` (not a scheduled run), GitHub does not de-prioritize it, so
+# the cadence actually holds. Runs entirely on GitHub's cloud — no Mac, no
+# external service, no PAT. Free: public repo = unlimited Actions minutes.
+#
+# RESILIENCE: a `schedule:` cron is kept as a re-seed so that if the chain ever
+# dies (a run fails to re-arm, repo paused, etc.) GitHub restarts it within a few
+# hours. The chain is primary; the cron is just a safety net to relight it.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Re-seed the chain a few times a day in case it ever breaks. NOT the primary
+    # cadence — the self-dispatch chain is. This only relights a dead chain.
+    - cron: '7 */3 * * *'
+
+permissions:
+  actions: write   # lets the built-in GITHUB_TOKEN dispatch workflows (self + killbot)
+
+# Never let two chains run at once: if a re-seed fires while a chain is alive,
+# cancel the older one so we don't fork into 2x, 4x, ... dispatch rates.
+concurrency:
+  group: killbot-heartbeat
+  cancel-in-progress: true
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Dispatch the killbot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "Hushlab Killbot" -R "${{ github.repository }}" \
+            && echo "killbot dispatched at $(date -u +%H:%M:%SZ)"
+
+      - name: Wait ~14 minutes
+        run: sleep 840
+
+      - name: Re-arm the chain (dispatch self)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "Killbot Heartbeat" -R "${{ github.repository }}" \
+            && echo "heartbeat re-armed at $(date -u +%H:%M:%SZ)"

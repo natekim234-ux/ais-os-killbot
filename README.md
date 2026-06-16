@@ -6,7 +6,7 @@ Hourly GitHub Actions cron that enforces 3 adset-level kill rules on Hushlab's M
 
 | Rule | Trigger | Why |
 |---|---|---|
-| **1. CPC mechanical** | `spend ≥ $15 AND CPC > $2.50` | A new adset is a new test. If click economics are broken once $15 is spent, kill fast. Adset-level (not campaign) so a single bad test can't hide inside a healthy CBO's averaged CPC. |
+| **1. CPC mechanical** | `spend ≥ $15 AND (outbound_clicks = 0 OR CPC > $2.50)` | A new adset is a new test. If click economics are broken once $15 is spent, kill fast. The zero-click branch is critical: a dead ad has 0 outbound clicks, so cost_per_outbound_click is null and the CPC test silently skips it — the worst ads were the most protected (CT41 hit $53 with 0 clicks). Adset-level so a bad test can't hide inside a healthy CBO's averaged CPC. |
 | **2. Zero buying intent** | `spend ≥ 1× breakeven CPP AND hours ≥ 24 AND ATC = 0 AND purchases = 0` | One full breakeven spent, one full day cycle, zero buying signal → click→site is broken. Stop bleeding. |
 | **3. Post-ATC bleed** | `spend ≥ 2× breakeven CPP AND ATC ≥ 1 AND purchases = 0` | ATC proves click→cart works (earns more rope than Rule 2). At 2× breakeven with no purchase, the cart is dying at checkout — copy/urgency problem, very unlikely to flip profitable. |
 

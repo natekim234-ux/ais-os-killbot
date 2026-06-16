@@ -7,12 +7,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Rule 1 — CPC mechanical kill
-//   IF adset.spend ≥ $15 AND adset.cpc > $2.50 → PAUSE adset.
+//   IF adset.spend ≥ $15 AND (outbound_clicks = 0 OR cpc > $2.50) → PAUSE adset.
 //   Reasoning: a new adset = a new test. If click economics are broken once
 //   $15 is spent, the test is failing fast. Doing this at the adset level
 //   (not campaign) prevents a single bad test from hiding inside a healthy
 //   CBO's averaged CPC. The $15 floor is half the prior $30 campaign floor —
 //   split per-adset, the noise tolerance scales with the spend per test.
+//   The zero-click branch (added 2026-06-16) is critical: a dead ad with 0
+//   outbound clicks has a NULL cost_per_outbound_click, so the cpc > $2.50 test
+//   silently skips it — meaning the WORST ads were the most protected. CT41
+//   drifted to $53 with 0 clicks before any other rule caught it. Now $15 spent
+//   with 0 clicks = infinite effective CPC = immediate kill.
 //
 // Rule 2 — Zero buying intent at 1× breakeven CPP
 //   IF adset.spend ≥ 1× breakeven CPP ($35.31 today)
@@ -156,6 +161,7 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
       'ctr',
       'cpc',
       'cost_per_outbound_click',
+      'outbound_clicks',
       'actions',
       'action_values',
       'cost_per_action_type',
@@ -168,6 +174,7 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
   const linkClicks = sumAction(d.actions, ['link_click']);
   const ctrLink = impressions > 0 ? (linkClicks / impressions) * 100 : null;
   const cpcOutbound = pickCost(d.cost_per_outbound_click, ['outbound_click']);
+  const outboundClicks = sumAction(d.outbound_clicks, ['outbound_click']);
   const atc = pickAction(d.actions, ['add_to_cart', 'offsite_conversion.fb_pixel_add_to_cart']);
   const purchases = pickAction(d.actions, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
   const cpp = pickCost(d.cost_per_action_type, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
@@ -180,6 +187,7 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
     cpm: Number(d.cpm ?? 0),
     ctrLink,
     cpcOutbound,
+    outboundClicks,
     linkClicks,
     atc,
     purchases,
@@ -344,6 +352,18 @@ function formatDateMDY(yyyyMmDd) {
 // ---------- Rules ----------
 
 function evaluate(m, hoursSinceAdsetStart, breakeven) {
+  // Rule 1a — zero-click kill. A dead ad gets NO outbound clicks, which means
+  // cost_per_outbound_click is null and the CPC branch below silently skips it
+  // (the worst ads were the most protected). If $15 is spent and not a single
+  // outbound click landed, effective CPC is infinite — kill it. (Added 2026-06-16
+  // after CT41 drifted to $53 with 0 clicks while invisible to the CPC branch.)
+  if (m.spend >= CPC_MIN_SPEND && m.outboundClicks === 0) {
+    return {
+      rule: 'Rule 1',
+      reason: `Zero outbound clicks at $${m.spend.toFixed(2)} spend (≥$${CPC_MIN_SPEND} floor)`,
+    };
+  }
+  // Rule 1b — CPC mechanical kill. Once clicks exist, kill if CPC > $2.50.
   if (m.spend >= CPC_MIN_SPEND && m.cpcOutbound != null && m.cpcOutbound > CPC_KILL) {
     return {
       rule: 'Rule 1',

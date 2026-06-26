@@ -138,7 +138,13 @@ async function metaGet(path, params = {}, attempt = 0) {
       await sleep(backoff);
       return metaGet(path, params, attempt + 1);
     }
-    throw new Error(`Meta GET ${path}: ${j.error.message}`);
+    const e = new Error(`Meta GET ${path}: ${j.error.message}`);
+    // Retryable error that exhausted all attempts = Meta is throttling us longer
+    // than our backoff window. Not a bug — tag it so the top-level handler can
+    // SKIP this tick (exit 0) instead of emitting a false GitHub failure email.
+    // The next ~14-min tick covers the skipped one; no budget is lost.
+    if (isRetryableMetaError(j.error, r.status)) e.transientThrottle = true;
+    throw e;
   }
   return j;
 }
@@ -1402,6 +1408,12 @@ import { fileURLToPath } from 'node:url';
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isDirectRun) {
   main().catch((e) => {
+    if (e?.transientThrottle) {
+      // Meta held a rate-limit past our retry window. Skip this tick cleanly —
+      // exit 0 so GitHub doesn't email a failure for a self-recovering blip.
+      console.warn(`SKIP (transient Meta throttle): ${e.message}. Next tick will retry.`);
+      process.exit(0);
+    }
     console.error('FATAL:', e);
     process.exit(1);
   });

@@ -1396,7 +1396,44 @@ async function main() {
   console.log(`Run complete — ${actionCount} action(s) logged.`);
 }
 
-main().catch((e) => {
-  console.error('FATAL:', e);
-  process.exit(1);
-});
+// Only auto-run when executed directly (node killbot.mjs), not when imported by
+// a one-shot that reuses these helpers (e.g. import-paused-ct.mjs).
+import { fileURLToPath } from 'node:url';
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isDirectRun) {
+  main().catch((e) => {
+    console.error('FATAL:', e);
+    process.exit(1);
+  });
+}
+
+export {
+  metaGet,
+  metaPause,
+  fetchAdsetMetrics,
+  fetchAdCopyBody,
+  fetchPctOfCampaignSpend7d,
+  evaluate,
+  writeCell,
+  appendLog,
+  ensureBotLogLayout,
+  buildLearningsTemplate,
+  writeLearningsTab,
+  buildResultsLine,
+  writeCopySubTab,
+  ensureMonthTab,
+  createTab,
+  getAllTabs,
+  findTabByTitle,
+  reorderMonthTabChildren,
+  ctNumberFromTitle,
+  tabNameForIso,
+  dateFromIso,
+  formatDateMDY,
+  easternTimestamp,
+  hoursSince,
+  sheets,
+  docs,
+  SHEET_ID,
+  LEARNINGS_DOC_ID,
+};

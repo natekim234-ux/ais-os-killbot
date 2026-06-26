@@ -1,0 +1,36 @@
+name: Import Paused CT
+
+# Manually import a single adset that was paused by hand in Ads Manager (so the
+# killbot never processed it — getActiveAdsets only returns ACTIVE adsets) into
+# the Hit Rate sheet + Learnings doc, exactly as a real kill would have.
+#
+# Dispatch with the adset ID. Defaults to dry-run; set dry_run=false to write.
+
+on:
+  workflow_dispatch:
+    inputs:
+      adset_id:
+        description: 'Adset ID to import (e.g. 120248335723620087 for CT58)'
+        required: true
+      dry_run:
+        description: 'true = report only; false = write to sheet + doc'
+        required: false
+        default: 'true'
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: node import-paused-ct.mjs
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+          ADSET_ID: ${{ github.event.inputs.adset_id }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}

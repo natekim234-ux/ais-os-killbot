@@ -109,13 +109,37 @@ const docs = google.docs({ version: 'v1', auth });
 
 // ---------- Meta ----------
 
-async function metaGet(path, params = {}) {
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+// Meta rate-limit / transient errors worth retrying. Codes: 4 (app limit),
+// 17 (user request limit reached), 32/613 (page/call rate), 80000/80004 (ad acct
+// limits), 1 & 2 (transient/unknown). Plus any HTTP 5xx. The 2026-06-25 fatal was
+// code 17 ("User request limit reached") from the schedule cron double-firing on
+// top of the heartbeat chain — exactly what this retry absorbs.
+function isRetryableMetaError(err, httpStatus) {
+  if (httpStatus >= 500) return true;
+  return [1, 2, 4, 17, 32, 613, 80000, 80004].includes(err?.code);
+}
+
+async function metaGet(path, params = {}, attempt = 0) {
+  const MAX_RETRIES = 4;
   const u = new URL(`${META_API}/${path}`);
   u.searchParams.set('access_token', META_TOKEN);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
   const r = await fetch(u);
   const j = await r.json();
-  if (j.error) throw new Error(`Meta GET ${path}: ${j.error.message}`);
+  if (j.error) {
+    if (isRetryableMetaError(j.error, r.status) && attempt < MAX_RETRIES) {
+      const backoff = Math.min(2000 * 2 ** attempt, 30000); // 2s,4s,8s,16s (cap 30s)
+      console.log(
+        `[retry] Meta GET ${path} hit "${j.error.message}" (code ${j.error.code}); ` +
+          `attempt ${attempt + 1}/${MAX_RETRIES} after ${backoff}ms`
+      );
+      await sleep(backoff);
+      return metaGet(path, params, attempt + 1);
+    }
+    throw new Error(`Meta GET ${path}: ${j.error.message}`);
+  }
   return j;
 }
 

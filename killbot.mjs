@@ -73,7 +73,16 @@ import { google } from 'googleapis';
 const SHEET_ID = '1NuOZWgP0mGhJ_MO6vevXj9EEpSxM94iUsFOULsEjehs';
 const BOT_LOG_SHEET_ID = 352736976; // 'Bot Log' tab sheetId (for batchUpdate dimension ops)
 const KPI_SHEET_ID = '1GWTUjvuYnSrn64nrqfLB9AsAKwDm4JCnk6c4nbhWM1A';
-const LEARNINGS_DOC_ID = '1vl5TQiCdfnbpA711Y5IpFl8ZkwmMvf3KQZu0Pq6Q3RE';
+// The active Learnings doc rolls over when it hits Google's 100-tab limit (see
+// rolloverLearningsDoc). The current doc ID is the source of truth in
+// Bot Control!B7 — main() reads it each run and rewrites it on rollover, so no
+// code edit/redeploy is ever needed. The constants below are only fallbacks.
+const LEARNINGS_DOC_CELL = 'Bot Control!B7';
+const LEARNINGS_DOC_FALLBACK = '1wURgBX75Jo95Q9CZ8F5k5AlLCZKHWLaztaicXm4QDrM'; // fresh CT62+ doc
+const LEARNINGS_FOLDER_ID = '1toR3RakgP2VjSidpeqEeG1DWfIzzeWOF'; // "Learning Docs" — archives live here
+// Resolved at the top of main() from LEARNINGS_DOC_CELL (falling back to the
+// constant above). Mutated in place by rolloverLearningsDoc.
+let LEARNINGS_DOC_ID = LEARNINGS_DOC_FALLBACK;
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 // Sheet tab per ad is derived from the adset's launch month (e.g. start_time
 // 2026-06-01 → 'June' tab). A May-launched adset that gets paused in June still
@@ -103,9 +112,12 @@ function need(k) {
 const auth = new google.auth.JWT(SA_JSON.client_email, null, SA_JSON.private_key, [
   'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/documents',
+  // drive scope: rename the full doc on rollover + move it into Learning Docs.
+  'https://www.googleapis.com/auth/drive',
 ]);
 const sheets = google.sheets({ version: 'v4', auth });
 const docs = google.docs({ version: 'v1', auth });
+const drive = google.drive({ version: 'v3', auth });
 
 // ---------- Meta ----------
 
@@ -526,6 +538,75 @@ async function createTab(title, parentTabId) {
   const newTabId = createResp.data.replies?.[0]?.addDocumentTab?.tabProperties?.tabId;
   if (!newTabId) throw new Error('addDocumentTab returned no tabId');
   return newTabId;
+}
+
+// True when a Docs batchUpdate error is the 100-tab ceiling.
+function isTabLimitError(e) {
+  return /limited to 100 tabs/i.test(e?.message ?? '');
+}
+
+// Scan every tab title in the doc for "CT<number>" and return the lowest and
+// highest CT seen. Used to name the archived doc "(CT12 - CT61)". Walks nested
+// tabs (CT tabs live under month parents; Copy sub-tabs also carry the CT#).
+async function ctRangeFromDoc(docId) {
+  const resp = await docs.documents.get({ documentId: docId, includeTabsContent: true });
+  const nums = [];
+  const walk = (t) => {
+    const m = (t.tabProperties?.title ?? '').match(/CT\s*(\d+)/i);
+    if (m) nums.push(Number(m[1]));
+    for (const c of t.childTabs ?? []) walk(c);
+  };
+  for (const t of resp.data.tabs ?? []) walk(t);
+  if (nums.length === 0) return null;
+  return { first: Math.min(...nums), last: Math.max(...nums) };
+}
+
+// Roll the active Learnings doc over when it hits the 100-tab limit:
+//   1. Compute the CT range from the full doc's tabs.
+//   2. Rename it "Hushlab Learnings Document (CT<first> - CT<last>)".
+//   3. Move it into the Learning Docs folder (archive).
+//   4. Create a fresh "Hushlab Learnings Document" in that same folder.
+//   5. Persist the new doc ID to Bot Control so future runs pick it up.
+//   6. Repoint the module-level LEARNINGS_DOC_ID and return the new ID.
+// The new doc's month tabs are created lazily by ensureMonthTab on the retry,
+// so it inherits the exact same naming + formatting conventions as before.
+async function rolloverLearningsDoc(oldDocId) {
+  const range = await ctRangeFromDoc(oldDocId);
+  const suffix = range ? ` (CT${range.first} - CT${range.last})` : ' (archive)';
+  const archiveName = `Hushlab Learnings Document${suffix}`;
+  console.log(`  ↻ 100-tab limit hit. Archiving current doc as "${archiveName}".`);
+
+  // Rename the full doc + move it into the Learning Docs folder in one update.
+  const cur = await drive.files.get({ fileId: oldDocId, fields: 'parents', supportsAllDrives: true });
+  const prevParents = (cur.data.parents ?? []).join(',');
+  await drive.files.update({
+    fileId: oldDocId,
+    requestBody: { name: archiveName },
+    addParents: LEARNINGS_FOLDER_ID,
+    removeParents: prevParents || undefined,
+    supportsAllDrives: true,
+  });
+  console.log(`  ✓ Archived + moved into Learning Docs folder.`);
+
+  // Create the fresh live doc directly inside the Learning Docs folder so the
+  // load-context skill (which globs that folder) picks it up automatically.
+  const created = await drive.files.create({
+    requestBody: {
+      name: 'Hushlab Learnings Document',
+      mimeType: 'application/vnd.google-apps.document',
+      parents: [LEARNINGS_FOLDER_ID],
+    },
+    fields: 'id',
+    supportsAllDrives: true,
+  });
+  const newId = created.data.id;
+  if (!newId) throw new Error('rollover: drive.files.create returned no id');
+
+  // Persist + repoint so this and all future runs write to the new doc.
+  await writeCell(SHEET_ID, LEARNINGS_DOC_CELL, newId);
+  LEARNINGS_DOC_ID = newId;
+  console.log(`  ✓ New live Learnings doc created: ${newId} (persisted to ${LEARNINGS_DOC_CELL}).`);
+  return newId;
 }
 
 // Parse a hypothesis string that may contain numbered items ("1. text\n2. text")
@@ -1117,6 +1198,19 @@ async function main() {
     return;
   }
 
+  // Resolve the active Learnings doc ID from Bot Control (source of truth),
+  // falling back to the constant on first run. rolloverLearningsDoc rewrites
+  // this cell when the 100-tab limit is hit, so the bot self-heals with no edit.
+  const docCell = await readRange(SHEET_ID, LEARNINGS_DOC_CELL);
+  const persistedDocId = String(docCell[0]?.[0] ?? '').trim();
+  if (persistedDocId) {
+    LEARNINGS_DOC_ID = persistedDocId;
+  } else {
+    await writeCell(SHEET_ID, LEARNINGS_DOC_CELL, LEARNINGS_DOC_FALLBACK);
+    console.log(`Seeded ${LEARNINGS_DOC_CELL} with fallback doc ${LEARNINGS_DOC_FALLBACK}.`);
+  }
+  console.log(`Learnings doc: ${LEARNINGS_DOC_ID}`);
+
   // Breakeven CPP from KPI sheet (formatted "$35.31").
   const kpi = await readRange(KPI_SHEET_ID, 'KPI calculation!G2');
   const breakevenRaw = String(kpi[0]?.[0] ?? '35.31').replace(/[^0-9.]/g, '');
@@ -1323,38 +1417,52 @@ async function main() {
         if (existing) {
           console.log(`  · Learnings doc tab "${tabTitle}" already exists — left untouched.`);
         } else {
-          // Find-or-create the month parent (May, June, …). Auto-creates the
-          // month tab when the calendar rolls over. Nest the CT tab inside it.
-          const { tabId: monthTabId, monthName } = await ensureMonthTab(launchDate);
-          const tabId = await createTab(tabTitle, monthTabId);
-          // Pass the WHOLE template through — writeLearningsTab needs
-          // hypStart/hypEnd/useNumberedList to render the Old Hypothesis as a
-          // native numbered list. Destructuring only {text, boldRanges} here
-          // silently dropped those fields and the list never got applied
-          // (the CT33/CT34 plain-text hypothesis bug, 2026-06-11).
-          const tpl = buildLearningsTemplate({
-            dateRange,
-            metrics: m,
-            oldHypothesis,
-            kill: verdict,
-          });
-          await writeLearningsTab({ tabId, ...tpl });
-          console.log(`  ✓ Learnings doc tab created under "${monthName}": "${tabTitle}"`);
+          // The full tab build, wrapped so a 100-tab-limit failure on ANY call
+          // triggers a rollover and one clean retry against the fresh doc.
+          const writeTabSet = async () => {
+            // Find-or-create the month parent (May, June, …). Auto-creates the
+            // month tab when the calendar rolls over. Nest the CT tab inside it.
+            const { tabId: monthTabId, monthName } = await ensureMonthTab(launchDate);
+            const tabId = await createTab(tabTitle, monthTabId);
+            // Pass the WHOLE template through — writeLearningsTab needs
+            // hypStart/hypEnd/useNumberedList to render the Old Hypothesis as a
+            // native numbered list. Destructuring only {text, boldRanges} here
+            // silently dropped those fields and the list never got applied
+            // (the CT33/CT34 plain-text hypothesis bug, 2026-06-11).
+            const tpl = buildLearningsTemplate({
+              dateRange,
+              metrics: m,
+              oldHypothesis,
+              kill: verdict,
+            });
+            await writeLearningsTab({ tabId, ...tpl });
+            console.log(`  ✓ Learnings doc tab created under "${monthName}": "${tabTitle}"`);
 
-          // Pull ad copy and create Copy sub-tab as a child of the new CT tab.
-          const adBody = await fetchAdCopyBody(adset.id);
-          const wrote = await writeCopySubTab({ parentTabId: tabId, parentTitle: tabTitle, body: adBody });
-          if (wrote) console.log(`  ✓ Copy sub-tab created: "Copy | ${tabTitle}"`);
-          else console.log(`  · No ad copy found for ${adset.id} — no Copy sub-tab.`);
+            // Pull ad copy and create Copy sub-tab as a child of the new CT tab.
+            const adBody = await fetchAdCopyBody(adset.id);
+            const wrote = await writeCopySubTab({ parentTabId: tabId, parentTitle: tabTitle, body: adBody });
+            if (wrote) console.log(`  ✓ Copy sub-tab created: "Copy | ${tabTitle}"`);
+            else console.log(`  · No ad copy found for ${adset.id} — no Copy sub-tab.`);
 
-          // Keep the month's CT tabs sorted lowest→highest CT number.
-          // addDocumentTab always appends, so a kill that arrives out of CT
-          // order (or several kills in one tick) lands wrong without this.
+            // Keep the month's CT tabs sorted lowest→highest CT number.
+            // addDocumentTab always appends, so a kill that arrives out of CT
+            // order (or several kills in one tick) lands wrong without this.
+            try {
+              const moved = await reorderMonthTabChildren(monthTabId);
+              if (moved) console.log(`  ✓ "${monthName}" tabs re-sorted by CT number`);
+            } catch (e) {
+              console.log(`  ! Tab reorder failed: ${e.message}`);
+            }
+          };
+
           try {
-            const moved = await reorderMonthTabChildren(monthTabId);
-            if (moved) console.log(`  ✓ "${monthName}" tabs re-sorted by CT number`);
+            await writeTabSet();
           } catch (e) {
-            console.log(`  ! Tab reorder failed: ${e.message}`);
+            if (!isTabLimitError(e)) throw e;
+            // Doc is full: archive it, spin up a fresh one, retry once. The
+            // retry runs against the new (empty) doc, so it can't re-hit the cap.
+            await rolloverLearningsDoc(LEARNINGS_DOC_ID);
+            await writeTabSet();
           }
         }
       } catch (e) {
@@ -1446,6 +1554,9 @@ export {
   hoursSince,
   sheets,
   docs,
+  drive,
+  readRange,
   SHEET_ID,
   LEARNINGS_DOC_ID,
+  LEARNINGS_DOC_CELL,
 };

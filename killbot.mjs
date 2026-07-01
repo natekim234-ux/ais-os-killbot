@@ -471,17 +471,47 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
   const adsetById = new Map(activeAdsets.map((a) => [a.id, a]));
   // Match `CT<#>` anywhere in the adset name with word boundaries on both
   // sides. Handles both `CT12 | Breathe | Lead v2` (old convention) and
-  // `05.25.26 | CT14 | Breathe` (new dated convention). If multiple adsets
-  // somehow share the same CT#, the last one wins; warn in that case.
-  const adsetsByCt = new Map();
+  // `05.25.26 | CT14 | Breathe` (new dated convention).
+  //
+  // IMPORTANT (multi-account): the SAME CT# can run in more than one ad account
+  // at once (same product/creative across Account 1 and Account 2). So a CT#
+  // maps to a LIST of candidate adsets, not one. Auto-fill must never guess
+  // across accounts — it disambiguates by the row's "Ad Account" column, and
+  // refuses (leaves blank + warns) when the CT# is ambiguous and the row gives
+  // no account signal. Picking "last one wins" here would silently write the
+  // wrong account's Ad Set ID into a row and corrupt all downstream tracking.
+  const adsetsByCt = new Map(); // ct -> [adset, ...]
   for (const a of activeAdsets) {
     const m = a.name.match(/\bCT(\d+)\b/i);
     if (!m) continue;
-    if (adsetsByCt.has(m[1])) {
-      console.log(`  ! Multiple ACTIVE adsets matched CT${m[1]}: ${adsetsByCt.get(m[1]).name} and ${a.name}. Using the latter.`);
-    }
-    adsetsByCt.set(m[1], a);
+    if (!adsetsByCt.has(m[1])) adsetsByCt.set(m[1], []);
+    adsetsByCt.get(m[1]).push(a);
   }
+
+  // Resolve the single adset a row should map to, given its CT#, the tab it
+  // lives on (launch-month guard), and its Ad Account cell. Returns the adset,
+  // or null with a logged reason (no match / ambiguous). Never guesses.
+  const resolveForRow = (ct, r) => {
+    const candidates = (adsetsByCt.get(ct) ?? []).filter(
+      (a) => tabNameForIso(a.start_time) === tab,
+    );
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+    // More than one ACTIVE adset shares this CT# in this month — disambiguate
+    // by the row's Ad Account label if we have that column and a value.
+    const rowAcct =
+      idx.account >= 0 ? String(rows[r]?.[idx.account] ?? '').trim() : '';
+    if (rowAcct) {
+      const byAcct = candidates.filter((a) => a.accountLabel === rowAcct);
+      if (byAcct.length === 1) return byAcct[0];
+    }
+    console.log(
+      `  ! [${tab}] Row ${r + 1} (CT${ct}): CT# is ACTIVE in multiple accounts (${candidates
+        .map((a) => a.accountLabel)
+        .join(', ')}) and the row's Ad Account ${rowAcct ? `("${rowAcct}") doesn't uniquely match` : 'is blank'} — refusing to auto-fill Ad Set ID (set it by hand to avoid cross-account misattribution).`,
+    );
+    return null;
+  };
 
   for (let r = 1; r < rows.length; r++) {
     const ct = String(rows[r]?.[idx.test] ?? '').trim();
@@ -499,9 +529,9 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
         //      live ACTIVE adset matches this row's CT# AND launched in this
         //      tab's month, repoint W at the live ID so the row tracks the
         //      adset that's actually running.
-        const relaunch = adsetsByCt.get(ct);
-        if (relaunch && tabNameForIso(relaunch.start_time) === tab) {
-          console.log(`  [${tab}] Row ${r + 1} (CT${ct}): stored Ad Set ID ${existingId} is not active; relaunch ${relaunch.id} (${relaunch.name}) found — repointing Ad Set ID.`);
+        const relaunch = resolveForRow(ct, r);
+        if (relaunch) {
+          console.log(`  [${tab}] Row ${r + 1} (CT${ct}): stored Ad Set ID ${existingId} is not active; relaunch ${relaunch.id} (${relaunch.name}, ${relaunch.accountLabel}) found — repointing Ad Set ID.`);
           if (!DRY_RUN) {
             await writeCell(SHEET_ID, `${tab}!${colA1(idx.adsetId)}${r + 1}`, relaunch.id);
           }
@@ -510,20 +540,19 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
       }
       continue;
     }
-    const match = adsetsByCt.get(ct);
+    // resolveForRow applies the launch-month guard AND the multi-account
+    // disambiguation (by the row's Ad Account column), refusing to guess when
+    // a CT# is ambiguous across accounts. It logs its own reason on null.
+    const match = resolveForRow(ct, r);
     if (!match) {
-      console.log(`  [${tab}] Row ${r + 1} (CT${ct}): no ACTIVE adset matching prefix CT${ct} — leaving Ad Set ID blank.`);
+      // resolveForRow already logged the specific reason (no match / ambiguous).
+      // Keep an explicit "no ACTIVE adset" line for the common single-account case.
+      if (!(adsetsByCt.get(ct) ?? []).some((a) => tabNameForIso(a.start_time) === tab)) {
+        console.log(`  [${tab}] Row ${r + 1} (CT${ct}): no ACTIVE adset matching prefix CT${ct} in ${tab} — leaving Ad Set ID blank.`);
+      }
       continue;
     }
-    // Only autofill on the row's own launch-month tab. Prevents writing a
-    // June-launched adset's ID into a May row that happens to share a CT#.
-    const rowLaunch = String(rows[r]?.[idx.launch] ?? '').trim();
-    const adsetLaunchTab = tabNameForIso(match.start_time);
-    if (adsetLaunchTab !== tab) {
-      console.log(`  [${tab}] Row ${r + 1} (CT${ct}): adset ${match.name} launched in ${adsetLaunchTab}, not ${tab} — skipping autofill here.`);
-      continue;
-    }
-    console.log(`  [${tab}] Row ${r + 1} (CT${ct}): auto-filling Ad Set ID = ${match.id} (${match.name})`);
+    console.log(`  [${tab}] Row ${r + 1} (CT${ct}): auto-filling Ad Set ID = ${match.id} (${match.name}, ${match.accountLabel})`);
     if (!DRY_RUN) {
       await writeCell(SHEET_ID, `${tab}!${colA1(idx.adsetId)}${r + 1}`, match.id);
     }

@@ -103,10 +103,34 @@ const META_TOKEN = need('META_ACCESS_TOKEN');
 const AD_ACCOUNT = need('META_AD_ACCOUNT_ID');
 const SA_JSON = JSON.parse(need('GOOGLE_SA_JSON'));
 
+// Hushlab runs the same product/creative across more than one ad account (e.g. a
+// 2nd account used to test whether CPMs are throttled at the account level). The
+// same rules apply to every account; we just loop over all of them each run.
+// Account 1 is required; account 2+ are optional so the bot degrades gracefully
+// if the extra env var isn't set. Same BM + same token reaches all of them.
+// `label` is what shows in the Bot Log "Account" column so kills are traceable.
+const AD_ACCOUNTS = [
+  { id: AD_ACCOUNT, label: 'Account 1' },
+  ...(process.env.META_AD_ACCOUNT_ID_2
+    ? [{ id: process.env.META_AD_ACCOUNT_ID_2, label: 'Hushlab 2nd Account' }]
+    : []),
+];
+
 function need(k) {
   const v = process.env[k];
   if (!v) throw new Error(`Missing env: ${k}`);
   return v;
+}
+
+// Convert a zero-based column index to an A1 column letter (0→A, 25→Z, 26→AA).
+// Sheet writes resolve their target column by HEADER NAME via the idx map, then
+// convert to a letter here — so inserting/moving a column (e.g. the "Account"
+// dropdown between Status and Results) can never misalign a write. Never
+// hardcode column letters for row writes.
+function colA1(index) {
+  let n = index, s = '';
+  do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+  return s;
 }
 
 const auth = new google.auth.JWT(SA_JSON.client_email, null, SA_JSON.private_key, [
@@ -171,10 +195,12 @@ async function metaPause(objectId) {
   return j;
 }
 
-// All ACTIVE adsets in the ad account, with their parent campaign id/name.
-// Returns [{id, name, campaign_id, campaign_name, start_time}].
-async function getActiveAdsets() {
-  const adsets = (await metaGet(`${AD_ACCOUNT}/adsets`, {
+// All ACTIVE adsets in a given ad account, with their parent campaign id/name.
+// Each adset is tagged with the account's label so downstream logging can show
+// which account it came from. Returns
+// [{id, name, campaign_id, campaign_name, start_time, accountId, accountLabel}].
+async function getActiveAdsets(account) {
+  const adsets = (await metaGet(`${account.id}/adsets`, {
     fields: 'id,name,status,start_time,campaign{id,name,status}',
     limit: '200',
   })).data ?? [];
@@ -186,6 +212,8 @@ async function getActiveAdsets() {
       campaign_id: a.campaign.id,
       campaign_name: a.campaign.name,
       start_time: a.start_time,
+      accountId: account.id,
+      accountLabel: account.label,
     }));
 }
 
@@ -473,9 +501,9 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
         //      adset that's actually running.
         const relaunch = adsetsByCt.get(ct);
         if (relaunch && tabNameForIso(relaunch.start_time) === tab) {
-          console.log(`  [${tab}] Row ${r + 1} (CT${ct}): stored Ad Set ID ${existingId} is not active; relaunch ${relaunch.id} (${relaunch.name}) found — repointing W.`);
+          console.log(`  [${tab}] Row ${r + 1} (CT${ct}): stored Ad Set ID ${existingId} is not active; relaunch ${relaunch.id} (${relaunch.name}) found — repointing Ad Set ID.`);
           if (!DRY_RUN) {
-            await writeCell(SHEET_ID, `${tab}!W${r + 1}`, relaunch.id);
+            await writeCell(SHEET_ID, `${tab}!${colA1(idx.adsetId)}${r + 1}`, relaunch.id);
           }
           rows[r][idx.adsetId] = relaunch.id; // reflect in-memory for this run
         }
@@ -497,7 +525,7 @@ async function autofillAdSetIds(rows, header, idx, activeAdsets, tab) {
     }
     console.log(`  [${tab}] Row ${r + 1} (CT${ct}): auto-filling Ad Set ID = ${match.id} (${match.name})`);
     if (!DRY_RUN) {
-      await writeCell(SHEET_ID, `${tab}!W${r + 1}`, match.id);
+      await writeCell(SHEET_ID, `${tab}!${colA1(idx.adsetId)}${r + 1}`, match.id);
     }
     rows[r][idx.adsetId] = match.id; // also reflect in-memory for this run
   }
@@ -1078,7 +1106,7 @@ async function reconcileSettledMetrics(rows, header, idx, breakeven, tab) {
       : `${formatDateMDY(launchDate)} – ${formatDateMDY(todayIso)}`;
     const resultsLine = buildResultsLine({ metrics: m, kill: verdict, dateRange });
     if (!DRY_RUN) {
-      await writeCell(SHEET_ID, `${tab}!S${r + 1}`, resultsLine);
+      await writeCell(SHEET_ID, `${tab}!${colA1(idx.results)}${r + 1}`, resultsLine);
     }
 
     // Find the matching doc tab (title === adset name) and refresh metrics block.
@@ -1217,9 +1245,20 @@ async function main() {
   const breakeven = Number(breakevenRaw) || 35.31;
   console.log(`Breakeven CPP: $${breakeven.toFixed(2)}`);
 
-  // Live snapshot from Meta.
-  const liveAdsets = await getActiveAdsets();
-  console.log(`Found ${liveAdsets.length} ACTIVE adset(s) under ACTIVE campaigns.`);
+  // Live snapshot from Meta — union of ACTIVE adsets across every configured
+  // ad account (each adset carries its accountLabel). A per-account fetch
+  // failure is logged and skipped so one bad account can't blank the run.
+  const liveAdsets = [];
+  for (const account of AD_ACCOUNTS) {
+    try {
+      const found = await getActiveAdsets(account);
+      console.log(`  [${account.label}] ${account.id}: ${found.length} ACTIVE adset(s).`);
+      liveAdsets.push(...found);
+    } catch (e) {
+      console.log(`  ! [${account.label}] ${account.id}: adset fetch failed — ${e.message}`);
+    }
+  }
+  console.log(`Found ${liveAdsets.length} ACTIVE adset(s) across ${AD_ACCOUNTS.length} account(s) under ACTIVE campaigns.`);
 
   // Discover which month tabs exist on the spreadsheet. We load every month
   // tab the spreadsheet has (typically the past few months) so the bot can
@@ -1232,24 +1271,27 @@ async function main() {
   // Snapshot each month tab. tabState[tab] = { rows, header, idx }.
   const tabState = {};
   for (const tab of monthTabs) {
-    const tRows = await readRange(SHEET_ID, `${tab}!A1:W500`);
+    // Read through AD to cover the "Account" column inserted between Status and
+    // Results (which pushed Ad Set ID past W) plus any headroom. All column
+    // positions are resolved by header name below, never by fixed offset.
+    const tRows = await readRange(SHEET_ID, `${tab}!A1:AD500`);
     const tHeader = tRows[0] ?? [];
     const tIdx = {
       test: tHeader.indexOf('Creative Test #'),
       launch: tHeader.indexOf('Launch Date (double click)'),
       status: tHeader.indexOf('Status'),
+      account: tHeader.indexOf('Ad Account'),
       results: tHeader.indexOf('Results'),
       hypothesis: tHeader.findIndex((h) => String(h).includes("What's your hypothesis")),
       adsetId: tHeader.indexOf('Ad Set ID'),
     };
-    if (tIdx.test < 0 || tIdx.adsetId < 0) {
+    // Status, Results and Ad Set ID are resolved purely by header name — no
+    // numeric fallback, because inserting the Account column shifts every
+    // position after Status and a hardcoded offset would silently misalign.
+    if (tIdx.test < 0 || tIdx.adsetId < 0 || tIdx.status < 0 || tIdx.results < 0) {
       console.log(`  · Skipping tab '${tab}' — missing required columns. idx=${JSON.stringify(tIdx)}`);
       continue;
     }
-    // Fall back to canonical positions if header lookup misses. Column R =
-    // Status (17), S = Results (18). Defensive — header text can rename.
-    if (tIdx.status < 0) tIdx.status = 17;
-    if (tIdx.results < 0) tIdx.results = 18;
     tabState[tab] = { rows: tRows, header: tHeader, idx: tIdx };
   }
 
@@ -1321,15 +1363,26 @@ async function main() {
       continue;
     }
 
-    // 2) Mirror PAUSED to sheet column R via USER_ENTERED writeCell.
+    // 2) Mirror PAUSED to the Status column via USER_ENTERED writeCell.
     //    Look up the row across all month tabs — adset's row lives on its
-    //    launch month's tab (e.g. June ads → June tab).
+    //    launch month's tab (e.g. June ads → June tab). Column resolved by
+    //    header index (not a hardcoded letter) so a column insert can't misalign.
     const rowRef = rowByAdset.get(adset.id);
     if (!rowRef) {
       console.log(`  ! Adset ${adset.id} not found on any month tab — sheet writes skipped.`);
     }
     if (rowRef && !DRY_RUN) {
-      await writeCell(SHEET_ID, `${rowRef.tab}!R${rowRef.rowNum}`, 'PAUSED');
+      await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(tabState[rowRef.tab].idx.status)}${rowRef.rowNum}`, 'PAUSED');
+      // Stamp which ad account this row's adset ran in (only if the row's Ad
+      // Account cell is empty — never clobber a value you set by hand). The
+      // dropdown lives between Status and Results.
+      const accIdx = tabState[rowRef.tab].idx.account;
+      if (accIdx >= 0) {
+        const existingAcc = String(tabState[rowRef.tab].rows[rowRef.rowNum - 1]?.[accIdx] ?? '').trim();
+        if (!existingAcc) {
+          await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(accIdx)}${rowRef.rowNum}`, adset.accountLabel ?? 'Account 1');
+        }
+      }
     }
 
     // 3) Reconcile final-state metrics. Meta's insights ledger lags actual
@@ -1365,12 +1418,13 @@ async function main() {
     // 4) % of campaign spend last 7d (best-effort).
     m.pctSpend7d = await fetchPctOfCampaignSpend7d(adset.id, adset.campaign_id);
 
-    // 5) Write a one-line Results summary to sheet column S. Mirrors the
+    // 5) Write a one-line Results summary to the Results column. Mirrors the
     //    metrics block in the Learnings doc so the sheet is self-sufficient
-    //    for quick scanning without opening the doc.
+    //    for quick scanning without opening the doc. Column resolved by header
+    //    index (not a hardcoded letter) so a column insert can't misalign.
     if (rowRef && !DRY_RUN) {
       const resultsLine = buildResultsLine({ metrics: m, kill: verdict, dateRange: `${formatDateMDY(launchDate)} – ${formatDateMDY(new Date().toISOString().slice(0, 10))}` });
-      await writeCell(SHEET_ID, `${rowRef.tab}!S${rowRef.rowNum}`, resultsLine);
+      await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(tabState[rowRef.tab].idx.results)}${rowRef.rowNum}`, resultsLine);
     }
 
     // 6) Build Learnings doc tab + Copy sub-tab, nested under the month parent.
@@ -1490,6 +1544,7 @@ async function main() {
       m.cpp != null ? m.cpp.toFixed(2) : '',
       m.cpcOutbound != null ? m.cpcOutbound.toFixed(2) : '',
       verdict.reason,
+      adset.accountLabel ?? 'Account 1', // Account column — which ad account this kill came from
     ]);
   }
 

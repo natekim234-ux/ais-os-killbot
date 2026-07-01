@@ -110,9 +110,9 @@ const SA_JSON = JSON.parse(need('GOOGLE_SA_JSON'));
 // if the extra env var isn't set. Same BM + same token reaches all of them.
 // `label` is what shows in the Bot Log "Account" column so kills are traceable.
 const AD_ACCOUNTS = [
-  { id: AD_ACCOUNT, label: 'Account 1' },
+  { id: AD_ACCOUNT, label: 'Hushlab Ad Account 1' },
   ...(process.env.META_AD_ACCOUNT_ID_2
-    ? [{ id: process.env.META_AD_ACCOUNT_ID_2, label: 'Hushlab 2nd Account' }]
+    ? [{ id: process.env.META_AD_ACCOUNT_ID_2, label: 'Hushlab Ad Account 2' }]
     : []),
 ];
 
@@ -1380,7 +1380,7 @@ async function main() {
       if (accIdx >= 0) {
         const existingAcc = String(tabState[rowRef.tab].rows[rowRef.rowNum - 1]?.[accIdx] ?? '').trim();
         if (!existingAcc) {
-          await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(accIdx)}${rowRef.rowNum}`, adset.accountLabel ?? 'Account 1');
+          await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(accIdx)}${rowRef.rowNum}`, adset.accountLabel ?? 'Hushlab Ad Account 1');
         }
       }
     }
@@ -1544,7 +1544,7 @@ async function main() {
       m.cpp != null ? m.cpp.toFixed(2) : '',
       m.cpcOutbound != null ? m.cpcOutbound.toFixed(2) : '',
       verdict.reason,
-      adset.accountLabel ?? 'Account 1', // Account column — which ad account this kill came from
+      adset.accountLabel ?? 'Hushlab Ad Account 1', // Account column — which ad account this kill came from
     ]);
   }
 

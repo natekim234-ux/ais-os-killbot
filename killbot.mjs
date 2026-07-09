@@ -7,14 +7,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Rule 1 — CPC mechanical kill
-//   IF adset.spend ≥ $15 AND (outbound_clicks = 0 OR cpc > $2.50) → PAUSE adset.
+//   IF adset.spend ≥ $15 AND (link_clicks = 0 OR cpc > $2.50) → PAUSE adset.
+//   CPC here = cost per LINK click (Ads Manager's "CPC (cost per link click)"
+//   column — the metric Nate's Performance view and the Hit Rate sheet use).
+//   Switched from outbound clicks 2026-07-09 after the CT83 false kill: at
+//   trigger time Meta had reported only 3 of what settled to 8 clicks, so the
+//   bot computed $5.48 while the true CPC was $2.29. Outbound-click reporting
+//   lags link-click reporting by up to hours on fresh adsets; link clicks are
+//   both the rule's actual definition and the fresher signal.
 //   Reasoning: a new adset = a new test. If click economics are broken once
 //   $15 is spent, the test is failing fast. Doing this at the adset level
 //   (not campaign) prevents a single bad test from hiding inside a healthy
 //   CBO's averaged CPC. The $15 floor is half the prior $30 campaign floor —
 //   split per-adset, the noise tolerance scales with the spend per test.
 //   The zero-click branch (added 2026-06-16) is critical: a dead ad with 0
-//   outbound clicks has a NULL cost_per_outbound_click, so the cpc > $2.50 test
+//   link clicks has a NULL cost-per-link-click, so the cpc > $2.50 test
 //   silently skips it — meaning the WORST ads were the most protected. CT41
 //   drifted to $53 with 0 clicks before any other rule caught it. Now $15 spent
 //   with 0 clicks = infinite effective CPC = immediate kill.
@@ -230,8 +237,6 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
       'cpm',
       'ctr',
       'cpc',
-      'cost_per_outbound_click',
-      'outbound_clicks',
       'actions',
       'action_values',
       'cost_per_action_type',
@@ -243,8 +248,9 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
   const impressions = Number(d.impressions ?? 0);
   const linkClicks = sumAction(d.actions, ['link_click']);
   const ctrLink = impressions > 0 ? (linkClicks / impressions) * 100 : null;
-  const cpcOutbound = pickCost(d.cost_per_outbound_click, ['outbound_click']);
-  const outboundClicks = sumAction(d.outbound_clicks, ['outbound_click']);
+  // CPC = cost per LINK click (matches Ads Manager's "CPC (cost per link
+  // click)" column and the Hit Rate sheet). Null when no clicks yet.
+  const cpcLink = pickCost(d.cost_per_action_type, ['link_click']);
   const atc = pickAction(d.actions, ['add_to_cart', 'offsite_conversion.fb_pixel_add_to_cart']);
   const purchases = pickAction(d.actions, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
   const cpp = pickCost(d.cost_per_action_type, ['purchase', 'offsite_conversion.fb_pixel_purchase']);
@@ -256,8 +262,7 @@ async function fetchAdsetMetrics(adsetId, sinceDate) {
     frequency: Number(d.frequency ?? 0),
     cpm: Number(d.cpm ?? 0),
     ctrLink,
-    cpcOutbound,
-    outboundClicks,
+    cpcLink,
     linkClicks,
     atc,
     purchases,
@@ -422,22 +427,23 @@ function formatDateMDY(yyyyMmDd) {
 // ---------- Rules ----------
 
 function evaluate(m, hoursSinceAdsetStart, breakeven) {
-  // Rule 1a — zero-click kill. A dead ad gets NO outbound clicks, which means
-  // cost_per_outbound_click is null and the CPC branch below silently skips it
+  // Rule 1a — zero-click kill. A dead ad gets NO link clicks, which means
+  // cost-per-link-click is null and the CPC branch below silently skips it
   // (the worst ads were the most protected). If $15 is spent and not a single
-  // outbound click landed, effective CPC is infinite — kill it. (Added 2026-06-16
+  // link click landed, effective CPC is infinite — kill it. (Added 2026-06-16
   // after CT41 drifted to $53 with 0 clicks while invisible to the CPC branch.)
-  if (m.spend >= CPC_MIN_SPEND && m.outboundClicks === 0) {
+  if (m.spend >= CPC_MIN_SPEND && m.linkClicks === 0) {
     return {
       rule: 'Rule 1',
-      reason: `Zero outbound clicks at $${m.spend.toFixed(2)} spend (≥$${CPC_MIN_SPEND} floor)`,
+      reason: `Zero link clicks at $${m.spend.toFixed(2)} spend (≥$${CPC_MIN_SPEND} floor)`,
     };
   }
   // Rule 1b — CPC mechanical kill. Once clicks exist, kill if CPC > $2.50.
-  if (m.spend >= CPC_MIN_SPEND && m.cpcOutbound != null && m.cpcOutbound > CPC_KILL) {
+  // CPC = cost per link click (see header) — switched from outbound 2026-07-09.
+  if (m.spend >= CPC_MIN_SPEND && m.cpcLink != null && m.cpcLink > CPC_KILL) {
     return {
       rule: 'Rule 1',
-      reason: `CPC $${m.cpcOutbound.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend`,
+      reason: `CPC $${m.cpcLink.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend`,
     };
   }
   if (
@@ -706,7 +712,7 @@ function buildLearningsTemplate({ dateRange, metrics, oldHypothesis, kill }) {
     `Frequency: ${safe(metrics.frequency, '', 2)}`,
     `CPM: ${safe(metrics.cpm, '$')}`,
     `CTR: ${metrics.ctrLink != null ? metrics.ctrLink.toFixed(2) + '%' : '—'}`,
-    `Cost Per Outbound Click: ${safe(metrics.cpcOutbound, '$')}`,
+    `CPC: ${safe(metrics.cpcLink, '$')}`,
     `% of Spend (Last 7 Days): ${metrics.pctSpend7d != null ? metrics.pctSpend7d.toFixed(1) + '%' : '—'}`,
     '',
     'Result: Loser',
@@ -831,7 +837,7 @@ function buildResultsLine({ metrics, kill, dateRange }) {
     `Frequency ${safe(m.frequency, '', 2)}`,
     `CPM ${safe(m.cpm, '$')}`,
     `CTR ${m.ctrLink != null ? m.ctrLink.toFixed(2) + '%' : '—'}`,
-    `CPC ${safe(m.cpcOutbound, '$')}`,
+    `CPC ${safe(m.cpcLink, '$')}`,
     `% of Spend (7d) ${m.pctSpend7d != null ? m.pctSpend7d.toFixed(1) + '%' : '—'}`,
   ].join('. ') + '.';
 }
@@ -985,7 +991,7 @@ async function refreshMetricsBlock({ tabId, metrics, kill, dateRange, preFetched
     `Frequency: ${safe(metrics.frequency, '', 2)}`,
     `CPM: ${safe(metrics.cpm, '$')}`,
     `CTR: ${metrics.ctrLink != null ? metrics.ctrLink.toFixed(2) + '%' : '—'}`,
-    `Cost Per Outbound Click: ${safe(metrics.cpcOutbound, '$')}`,
+    `CPC: ${safe(metrics.cpcLink, '$')}`,
     `% of Spend (Last 7 Days): ${metrics.pctSpend7d != null ? metrics.pctSpend7d.toFixed(1) + '%' : '—'}`,
     '',
     'Result: Loser',
@@ -1375,7 +1381,7 @@ async function main() {
     }
 
     console.log(
-      `Adset ${adset.name} (${adset.id}) — spend $${m.spend.toFixed(2)}, ${hours.toFixed(1)}h, ATC ${m.atc}, P ${m.purchases}, CPC ${m.cpcOutbound != null ? '$' + m.cpcOutbound.toFixed(2) : '—'}, CTR ${m.ctrLink != null ? m.ctrLink.toFixed(2) + '%' : '—'}`,
+      `Adset ${adset.name} (${adset.id}) — spend $${m.spend.toFixed(2)}, ${hours.toFixed(1)}h, ATC ${m.atc}, P ${m.purchases}, CPC ${m.cpcLink != null ? '$' + m.cpcLink.toFixed(2) : '—'}, CTR ${m.ctrLink != null ? m.ctrLink.toFixed(2) + '%' : '—'}`,
     );
 
     const verdict = evaluate(m, hours, breakeven);
@@ -1435,8 +1441,8 @@ async function main() {
       console.log(`  · Reconciled spend $${m.spend.toFixed(2)}${moved ? ' (post-pause drift settled)' : ''}`);
       // Update the kill reason to reflect the reconciled spend so the doc
       // and the Bot Log don't show stale at-trigger numbers.
-      if (verdict.rule === 'Rule 1' && m.cpcOutbound != null) {
-        verdict.reason = `CPC $${m.cpcOutbound.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend`;
+      if (verdict.rule === 'Rule 1' && m.cpcLink != null) {
+        verdict.reason = `CPC $${m.cpcLink.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend`;
       } else if (verdict.rule === 'Rule 2') {
         verdict.reason = `Zero buying intent at $${m.spend.toFixed(2)} after ${hours.toFixed(1)}h (≥1× breakeven $${breakeven.toFixed(2)})`;
       } else if (verdict.rule === 'Rule 3') {
@@ -1571,7 +1577,7 @@ async function main() {
       String(m.atc),
       String(m.purchases),
       m.cpp != null ? m.cpp.toFixed(2) : '',
-      m.cpcOutbound != null ? m.cpcOutbound.toFixed(2) : '',
+      m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
       verdict.reason,
       adset.accountLabel ?? 'Hushlab Ad Account 1', // Account column — which ad account this kill came from
     ]);

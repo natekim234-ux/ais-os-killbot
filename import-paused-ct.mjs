@@ -80,7 +80,7 @@ async function readRange(spreadsheetId, range) {
 
   // Metrics over the adset's own run window — same call the bot makes.
   const m = await fetchAdsetMetrics(adset.id, launchDate);
-  console.log(`Metrics — spend $${m.spend.toFixed(2)}, ${hours.toFixed(1)}h, ATC ${m.atc}, P ${m.purchases}, outboundCPC ${m.cpcOutbound != null ? '$' + m.cpcOutbound.toFixed(2) : '—'}, outboundClicks ${m.outboundClicks}, CTR ${m.ctrLink != null ? m.ctrLink.toFixed(2) + '%' : '—'}`);
+  console.log(`Metrics — spend $${m.spend.toFixed(2)}, ${hours.toFixed(1)}h, ATC ${m.atc}, P ${m.purchases}, CPC ${m.cpcLink != null ? '$' + m.cpcLink.toFixed(2) : '—'}, linkClicks ${m.linkClicks}, CTR ${m.ctrLink != null ? m.ctrLink.toFixed(2) + '%' : '—'}`);
 
   // Determine the verdict using the bot's exact evaluate(). If it trips a rule,
   // attribute that rule. If it doesn't (a true manual kill that no rule would
@@ -88,16 +88,16 @@ async function readRange(spreadsheetId, range) {
   let verdict = evaluate(m, hours, breakeven);
   if (!verdict) {
     // True manual kill — no automated rule fired. Build an honest reason. If the
-    // outbound CPC was already over the Rule 1 line ($2.50) but spend hadn't yet
-    // reached the $15 Rule 1 floor, note that the CPC was trending to a kill —
-    // i.e. the bot would have caught it had it been left to spend $15.
+    // CPC (cost per link click) was already over the Rule 1 line ($2.50) but
+    // spend hadn't yet reached the $15 Rule 1 floor, note that the CPC was
+    // trending to a kill — i.e. the bot would have caught it at $15 spent.
     const CPC_KILL = 2.5;
     const CPC_MIN_SPEND = 15;
-    const cpcOverLine = m.cpcOutbound != null && m.cpcOutbound > CPC_KILL;
+    const cpcOverLine = m.cpcLink != null && m.cpcLink > CPC_KILL;
     const underFloor = m.spend < CPC_MIN_SPEND;
     let reason = `Paused manually in Ads Manager at $${m.spend.toFixed(2)} after ${hours.toFixed(1)}h (did not trip an automated kill rule)`;
     if (cpcOverLine && underFloor) {
-      reason = `Paused manually at $${m.spend.toFixed(2)}/${hours.toFixed(1)}h — CPC $${m.cpcOutbound.toFixed(2)} was already over the $${CPC_KILL.toFixed(2)} Rule 1 line, just short of the $${CPC_MIN_SPEND} spend floor (CPC trending to kill)`;
+      reason = `Paused manually at $${m.spend.toFixed(2)}/${hours.toFixed(1)}h — CPC $${m.cpcLink.toFixed(2)} was already over the $${CPC_KILL.toFixed(2)} Rule 1 line, just short of the $${CPC_MIN_SPEND} spend floor (CPC trending to kill)`;
     }
     verdict = { rule: 'Manual', reason };
     console.log(`  → No automated rule tripped. Recording as MANUAL kill: ${reason}`);
@@ -196,7 +196,7 @@ async function readRange(spreadsheetId, range) {
     String(m.atc),
     String(m.purchases),
     m.cpp != null ? m.cpp.toFixed(2) : '',
-    m.cpcOutbound != null ? m.cpcOutbound.toFixed(2) : '',
+    m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
     verdict.reason,
   ]);
   console.log(`  ✓ Bot Log appended`);

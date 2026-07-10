@@ -44,7 +44,7 @@
 //   UNKILLED to Bot Log. False kills self-heal within ~2 hours.
 //
 // Rule 2 — Zero buying intent at 1× breakeven CPP
-//   IF adset.spend ≥ 1× breakeven CPP ($35.31 today)
+//   IF adset.spend ≥ 1× breakeven CPP ($14.84 as of 2026-07-10 KPI sheet)
 //      AND adset.hours_since_start ≥ 24
 //      AND adset.ATC = 0 AND adset.purchases = 0
 //   → PAUSE adset.
@@ -54,7 +54,7 @@
 //   and not getting more rope.
 //
 // Rule 3 — Post-ATC bleed at 2× breakeven CPP
-//   IF adset.spend ≥ 2× breakeven CPP ($70.62 today)
+//   IF adset.spend ≥ 2× breakeven CPP ($29.69 as of 2026-07-10 KPI sheet)
 //      AND adset.ATC ≥ 1 AND adset.purchases = 0
 //   → PAUSE adset.
 //   Reasoning: an ATC proves click→cart works, so it earns more rope than
@@ -1402,8 +1402,8 @@ async function main() {
 
   // Breakeven CPP from KPI sheet (formatted "$35.31").
   const kpi = await readRange(KPI_SHEET_ID, 'KPI calculation!G2');
-  const breakevenRaw = String(kpi[0]?.[0] ?? '35.31').replace(/[^0-9.]/g, '');
-  const breakeven = Number(breakevenRaw) || 35.31;
+  const breakevenRaw = String(kpi[0]?.[0] ?? '14.84').replace(/[^0-9.]/g, '');
+  const breakeven = Number(breakevenRaw) || 14.84;
   console.log(`Breakeven CPP: $${breakeven.toFixed(2)}`);
 
   // Live snapshot from Meta — union of ACTIVE adsets across every configured

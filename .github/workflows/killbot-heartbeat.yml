@@ -17,9 +17,12 @@ name: Killbot Heartbeat
 on:
   workflow_dispatch:
   schedule:
-    # Re-seed the chain a few times a day in case it ever breaks. NOT the primary
-    # cadence — the self-dispatch chain is. This only relights a dead chain.
-    - cron: '7 */3 * * *'
+    # Re-seed the chain in case it ever breaks. NOT the primary cadence — the
+    # self-dispatch chain is. Every 30 min (was every 3h): a dead chain now gets
+    # relit within ~30-60 min instead of hours, capping any kill-rule blind spot.
+    # concurrency cancel-in-progress makes overlapping seeds harmless — a seed
+    # landing on a live chain just replaces the sleeping beat and carries on.
+    - cron: '*/30 * * * *'
 
 permissions:
   actions: write   # lets the built-in GITHUB_TOKEN dispatch workflows (self + killbot)

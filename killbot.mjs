@@ -26,6 +26,23 @@
 //   drifted to $53 with 0 clicks before any other rule caught it. Now $15 spent
 //   with 0 clicks = infinite effective CPC = immediate kill.
 //
+//   TWO-STRIKE CONFIRMATION (added 2026-07-10 after the CT84 false kill):
+//   a Rule 1 breach no longer kills on first sight. The first breach writes a
+//   PENDING flag (Bot Pending tab); the kill executes only if the breach still
+//   holds on a later run ≥45 min after the first flag. Why: Meta's insights
+//   reporting on FRESH adsets lags real clicks by up to ~1h for link clicks
+//   too, not just outbound (CT83: 3 of 8 clicks reported → phantom $5.48 CPC,
+//   true $2.29; CT84: 5 of 8 reported → phantom $3.85, true ~$2.40). A single
+//   snapshot in hours 1-2 is unreliable; 45 min later the ledger has settled.
+//   Cost on a TRUE loser: ~$10-12 extra spend. Rules 2/3 keep single-strike —
+//   they're cumulative-spend + time-gated, so lag can't fake them.
+//
+//   POST-KILL AUDIT (same date): ≥60 min after any Rule 1 kill, the bot
+//   re-pulls settled insights for the killed adset. If settled CPC ≤ $2.50
+//   with ≥1 link click, the kill was false — the bot reactivates the adset,
+//   restores the sheet Status to ACTIVE, clears the Results line, and logs
+//   UNKILLED to Bot Log. False kills self-heal within ~2 hours.
+//
 // Rule 2 — Zero buying intent at 1× breakeven CPP
 //   IF adset.spend ≥ 1× breakeven CPP ($35.31 today)
 //      AND adset.hours_since_start ≥ 24
@@ -105,6 +122,13 @@ const RECONCILE_WINDOW_DAYS = 7; // refresh settled metrics for adsets paused wi
 
 const CPC_MIN_SPEND = 15;
 const CPC_KILL = 2.5;
+
+// Rule 1 two-strike + post-kill audit (see header). State lives on the
+// 'Bot Pending' sheet tab so it survives across runs (bot is stateless).
+const PENDING_TAB = 'Bot Pending';
+const CONFIRM_MINUTES = 45; // first Rule-1 flag must be at least this old before a kill can execute
+const AUDIT_MIN_MINUTES = 60; // re-check settled CPC this long after a Rule 1 kill
+const PENDING_STALE_HOURS = 24; // prune state rows older than this (adset gone, manual pause, etc.)
 
 const META_TOKEN = need('META_ACCESS_TOKEN');
 const AD_ACCOUNT = need('META_AD_ACCOUNT_ID');
@@ -200,6 +224,25 @@ async function metaPause(objectId) {
   const j = await r.json();
   if (j.error) throw new Error(`Meta pause ${objectId}: ${j.error.message}`);
   return j;
+}
+
+// Reactivate an adset the bot itself paused (post-kill audit un-kill path).
+// Never called for anything the bot didn't pause via Rule 1 this same day.
+async function metaActivate(objectId) {
+  if (DRY_RUN) return { dry_run: true };
+  const u = new URL(`${META_API}/${objectId}`);
+  const body = new URLSearchParams({ status: 'ACTIVE', access_token: META_TOKEN });
+  const r = await fetch(u, { method: 'POST', body });
+  const j = await r.json();
+  if (j.error) throw new Error(`Meta activate ${objectId}: ${j.error.message}`);
+  return j;
+}
+
+// Current delivery status of a single adset (audit pass checks the adset is
+// still PAUSED before un-killing, so it never fights a manual change).
+async function fetchAdsetStatus(adsetId) {
+  const j = await metaGet(adsetId, { fields: 'status' });
+  return j.status;
 }
 
 // All ACTIVE adsets in a given ad account, with their parent campaign id/name.
@@ -392,6 +435,82 @@ async function appendLog(row) {
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values: [row] },
   });
+}
+
+// ---------- Rule 1 two-strike / audit state (Bot Pending tab) ----------
+//
+// Row shape: [Adset ID, Type, Timestamp (UTC ISO), Adset Name, CPC, Spend, Note]
+//   Type 'PENDING' — Rule 1 breach seen once; kill allowed only ≥CONFIRM_MINUTES later.
+//   Type 'AUDIT'   — Rule 1 kill executed; settled re-check due ≥AUDIT_MIN_MINUTES later.
+// The tab is tiny (a handful of rows) so each run reads it fully and rewrites
+// it fully — no row-index bookkeeping to corrupt.
+
+async function ensurePendingTab() {
+  try {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: PENDING_TAB, gridProperties: { rowCount: 100, columnCount: 8 } } } }] },
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `${PENDING_TAB}!A1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['Adset ID', 'Type', 'Timestamp (UTC)', 'Adset Name', 'CPC', 'Spend', 'Note', 'Account']] },
+    });
+    console.log(`Created '${PENDING_TAB}' state tab.`);
+  } catch (e) {
+    if (!/already exists/i.test(e.message)) throw e;
+  }
+}
+
+async function readPendingState() {
+  await ensurePendingTab();
+  const rows = await readRange(SHEET_ID, `${PENDING_TAB}!A2:H100`);
+  return rows
+    .filter((r) => String(r?.[0] ?? '').trim())
+    .map((r) => ({
+      adsetId: String(r[0]).trim(),
+      type: String(r[1] ?? '').trim(),
+      atIso: String(r[2] ?? '').trim(),
+      name: String(r[3] ?? ''),
+      cpc: String(r[4] ?? ''),
+      spend: String(r[5] ?? ''),
+      note: String(r[6] ?? ''),
+      account: String(r[7] ?? ''),
+    }))
+    // A hand-mangled timestamp would otherwise make the row immortal (never
+    // confirms, never prunes). Drop it; a live breach simply re-flags fresh.
+    .filter((p) => {
+      if (Number.isFinite(new Date(p.atIso).getTime())) return true;
+      console.log(`! ${PENDING_TAB}: dropping row with unparseable timestamp (${p.adsetId} ${p.type} "${p.atIso}").`);
+      return false;
+    });
+}
+
+async function writePendingState(entries) {
+  // One padded update over the full range — atomic, so a quota blip can't
+  // land between a clear and a write and wipe every in-flight timer.
+  const values = entries.map((p) => [p.adsetId, p.type, p.atIso, p.name, p.cpc, p.spend, p.note, p.account ?? '']);
+  while (values.length < 99) values.push(['', '', '', '', '', '', '', '']);
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${PENDING_TAB}!A2:H100`,
+    valueInputOption: 'RAW',
+    requestBody: { values },
+  });
+}
+
+// Rules 2/3 are single-strike and must not be shadowed while a Rule 1 breach
+// sits in its pending window — re-evaluate with the CPC branch muted.
+function nonCpcVerdict(m, hours, breakeven) {
+  return evaluate({ ...m, cpcLink: 0.01, linkClicks: Math.max(1, m.linkClicks) }, hours, breakeven);
+}
+
+function minutesSinceIso(iso) {
+  const t = new Date(iso).getTime();
+  // Unparseable timestamp → treat as brand-new (-1). Fails SAFE: a corrupt
+  // PENDING row can never satisfy the ≥45m confirmation and trigger a kill.
+  return Number.isFinite(t) ? (Date.now() - t) / 60000 : -1;
 }
 
 // ---------- Date helpers ----------
@@ -1356,6 +1475,16 @@ async function main() {
     }
   }
 
+  // Rule 1 two-strike + audit state (survives across runs on the Bot Pending tab).
+  let pendingState = [];
+  try {
+    pendingState = await readPendingState();
+  } catch (e) {
+    console.log(`! Bot Pending read failed (${e.message}) — two-strike state unavailable this run; Rule 1 kills DEFERRED, not executed blind.`);
+    pendingState = null; // null = state unreadable; never kill on Rule 1 without confirmable state
+  }
+  let stateDirty = false;
+
   let actionCount = 0;
   // Evaluate in ascending CT order so that when several adsets die in the same
   // tick, their Learnings tabs are CREATED lowest-CT-first (CT34 was processed
@@ -1384,7 +1513,88 @@ async function main() {
       `Adset ${adset.name} (${adset.id}) — spend $${m.spend.toFixed(2)}, ${hours.toFixed(1)}h, ATC ${m.atc}, P ${m.purchases}, CPC ${m.cpcLink != null ? '$' + m.cpcLink.toFixed(2) : '—'}, CTR ${m.ctrLink != null ? m.ctrLink.toFixed(2) + '%' : '—'}`,
     );
 
-    const verdict = evaluate(m, hours, breakeven);
+    let verdict = evaluate(m, hours, breakeven);
+
+    // Rule 1 two-strike: first breach only flags PENDING; the kill executes on
+    // a later run once the flag is ≥CONFIRM_MINUTES old AND the breach still
+    // holds against fresher data. A breach that clears in between is a
+    // reporting-lag phantom — drop the flag and log the save.
+    if (pendingState !== null) {
+      const pIdx = pendingState.findIndex((p) => p.adsetId === adset.id && p.type === 'PENDING');
+      if (verdict?.rule === 'Rule 1') {
+        if (pIdx < 0) {
+          pendingState.push({
+            adsetId: adset.id,
+            type: 'PENDING',
+            atIso: new Date().toISOString(),
+            name: adset.name,
+            cpc: m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
+            spend: m.spend.toFixed(2),
+            note: verdict.reason,
+          });
+          stateDirty = true;
+          console.log(`  → ${verdict.rule} strike 1: PENDING — ${verdict.reason}. Confirm on a run ≥${CONFIRM_MINUTES}m from now.`);
+          await appendLog([
+            easternTimestamp(),
+            String(ctNumberFromTitle(adset.name) ?? ''),
+            adset.id,
+            adset.name,
+            verdict.rule,
+            'PENDING' + (DRY_RUN ? ' [DRY]' : ''),
+            m.spend.toFixed(2),
+            String(m.atc),
+            String(m.purchases),
+            m.cpp != null ? m.cpp.toFixed(2) : '',
+            m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
+            `${verdict.reason} — strike 1, confirming in ≥${CONFIRM_MINUTES}m`,
+            adset.accountLabel ?? 'Hushlab Ad Account 1',
+          ]);
+          verdict = nonCpcVerdict(m, hours, breakeven);
+          if (!verdict) continue;
+          console.log(`  → Rule 1 pending, but ${verdict.rule} holds on its own — proceeding single-strike.`);
+        } else {
+          const ageMin = minutesSinceIso(pendingState[pIdx].atIso);
+          if (ageMin < CONFIRM_MINUTES) {
+            console.log(`  → ${verdict.rule} still breached — pending ${ageMin.toFixed(0)}m/${CONFIRM_MINUTES}m, waiting.`);
+            verdict = nonCpcVerdict(m, hours, breakeven);
+            if (!verdict) continue;
+            console.log(`  → Rule 1 pending, but ${verdict.rule} holds on its own — proceeding single-strike.`);
+          } else {
+            // (2nd strike confirmed. The PENDING row is removed only AFTER the
+            // pause call succeeds — a transient pause failure must not reset
+            // the 45-minute timer.)
+            verdict.confirmNote = ` (confirmed 2nd strike, ${ageMin.toFixed(0)}m after first flag)`;
+            verdict.reason += verdict.confirmNote;
+          }
+        }
+      } else if (pIdx >= 0) {
+        // Breach cleared before confirmation — reporting lag phantom, saved.
+        const saved = pendingState.splice(pIdx, 1)[0];
+        stateDirty = true;
+        console.log(`  ✓ Rule 1 flag cleared for ${adset.name} — CPC settled to ${m.cpcLink != null ? '$' + m.cpcLink.toFixed(2) : '—'} (was ${saved.cpc ? '$' + saved.cpc : 'no clicks'}). False kill avoided.`);
+        await appendLog([
+          easternTimestamp(),
+          String(ctNumberFromTitle(adset.name) ?? ''),
+          adset.id,
+          adset.name,
+          'Rule 1',
+          'RECOVERED' + (DRY_RUN ? ' [DRY]' : ''),
+          m.spend.toFixed(2),
+          String(m.atc),
+          String(m.purchases),
+          m.cpp != null ? m.cpp.toFixed(2) : '',
+          m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
+          `CPC settled under $${CPC_KILL.toFixed(2)} before 2nd strike (flagged at ${saved.cpc ? '$' + saved.cpc : '0 clicks'}/$${saved.spend}) — reporting-lag phantom`,
+          adset.accountLabel ?? 'Hushlab Ad Account 1',
+        ]);
+        if (!verdict) continue;
+      }
+      if (!verdict) continue;
+    } else if (verdict?.rule === 'Rule 1') {
+      // State tab unreadable — refuse to kill on a single unconfirmed snapshot.
+      console.log(`  ! ${verdict.rule} breach seen but Bot Pending is unreadable — kill deferred to next run.`);
+      continue;
+    }
     if (!verdict) continue;
 
     console.log(`  → ${verdict.rule}: PAUSE — ${verdict.reason}`);
@@ -1396,6 +1606,41 @@ async function main() {
     } catch (e) {
       console.log(`  ! Meta pause failed: ${e.message}`);
       continue;
+    }
+
+    // Pause succeeded: retire any PENDING flag for this adset (whatever rule
+    // fired), and give Rule 1 kills a settled-data audit ≥AUDIT_MIN_MINUTES
+    // later — if the settled CPC lands back under the line, the kill
+    // self-reverses (UNKILLED).
+    if (pendingState !== null) {
+      const spent = pendingState.findIndex((p) => p.adsetId === adset.id && p.type === 'PENDING');
+      if (spent >= 0) {
+        pendingState.splice(spent, 1);
+        stateDirty = true;
+      }
+      if (verdict.rule === 'Rule 1') {
+        pendingState.push({
+          adsetId: adset.id,
+          type: 'AUDIT',
+          atIso: new Date().toISOString(),
+          name: adset.name,
+          cpc: m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
+          spend: m.spend.toFixed(2),
+          note: `killed: ${verdict.reason}`,
+          account: adset.accountLabel ?? 'Hushlab Ad Account 1',
+        });
+        stateDirty = true;
+      }
+      // Persist NOW — the doc/sheet steps below can throw, and an unrecorded
+      // kill would otherwise never get its false-kill audit.
+      if (stateDirty && !DRY_RUN) {
+        try {
+          await writePendingState(pendingState);
+          stateDirty = false;
+        } catch (e) {
+          console.log(`! Bot Pending write failed post-kill: ${e.message}`);
+        }
+      }
     }
 
     // 2) Mirror PAUSED to the Status column via USER_ENTERED writeCell.
@@ -1442,7 +1687,7 @@ async function main() {
       // Update the kill reason to reflect the reconciled spend so the doc
       // and the Bot Log don't show stale at-trigger numbers.
       if (verdict.rule === 'Rule 1' && m.cpcLink != null) {
-        verdict.reason = `CPC $${m.cpcLink.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend`;
+        verdict.reason = `CPC $${m.cpcLink.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend` + (verdict.confirmNote ?? '');
       } else if (verdict.rule === 'Rule 2') {
         verdict.reason = `Zero buying intent at $${m.spend.toFixed(2)} after ${hours.toFixed(1)}h (≥1× breakeven $${breakeven.toFixed(2)})`;
       } else if (verdict.rule === 'Rule 3') {
@@ -1581,6 +1826,97 @@ async function main() {
       verdict.reason,
       adset.accountLabel ?? 'Hushlab Ad Account 1', // Account column — which ad account this kill came from
     ]);
+  }
+
+  // Post-kill audit: for every Rule 1 kill ≥AUDIT_MIN_MINUTES old, re-pull the
+  // settled insights. Settled CPC ≤ $2.50 with ≥1 link click = false kill →
+  // reactivate, restore sheet Status, log UNKILLED. Still breached = confirmed,
+  // drop the audit row. Never touches an adset that isn't still PAUSED (so a
+  // manual reactivation or delete is never fought).
+  if (pendingState !== null) {
+    for (const entry of [...pendingState]) {
+      if (entry.type !== 'AUDIT') continue;
+      const ageMin = minutesSinceIso(entry.atIso);
+      if (ageMin < AUDIT_MIN_MINUTES) continue;
+      const drop = () => {
+        const i = pendingState.indexOf(entry);
+        if (i >= 0) pendingState.splice(i, 1);
+        stateDirty = true;
+      };
+      if (ageMin > PENDING_STALE_HOURS * 60) { drop(); continue; }
+      try {
+        const status = await fetchAdsetStatus(entry.adsetId);
+        if (status !== 'PAUSED') {
+          console.log(`Audit ${entry.name}: adset status is ${status} (not PAUSED) — leaving alone.`);
+          drop();
+          continue;
+        }
+        const startJ = await metaGet(entry.adsetId, { fields: 'start_time' });
+        const sm = await fetchAdsetMetrics(entry.adsetId, dateFromIso(startJ.start_time));
+        // A Rule 1 kill required ≥$15 spend, so a settled read below that is a
+        // transient blank/partial insights response (the CT33 false-0% mode) —
+        // retry next run instead of "confirming" the kill on bogus data.
+        if (sm.spend < CPC_MIN_SPEND) {
+          console.log(`! Audit ${entry.name}: settled insights look blank (spend $${sm.spend.toFixed(2)} < $${CPC_MIN_SPEND}) — retrying next run.`);
+          continue;
+        }
+        const falseKill = sm.cpcLink != null && sm.linkClicks > 0 && sm.cpcLink <= CPC_KILL;
+        if (!falseKill) {
+          console.log(`Audit ${entry.name}: kill CONFIRMED on settled data (CPC ${sm.cpcLink != null ? '$' + sm.cpcLink.toFixed(2) : '— no clicks'} at $${sm.spend.toFixed(2)}).`);
+          drop();
+          continue;
+        }
+        console.log(`Audit ${entry.name}: FALSE KILL — settled CPC $${sm.cpcLink.toFixed(2)} ≤ $${CPC_KILL.toFixed(2)}. Reactivating.`);
+        await metaActivate(entry.adsetId);
+        const ref = rowByAdset.get(entry.adsetId);
+        if (ref && !DRY_RUN) {
+          await writeCell(SHEET_ID, `${ref.tab}!${colA1(tabState[ref.tab].idx.status)}${ref.rowNum}`, 'ACTIVE');
+          await writeCell(SHEET_ID, `${ref.tab}!${colA1(tabState[ref.tab].idx.results)}${ref.rowNum}`, '');
+          // Mirror into the in-memory snapshot so reconcileSettledMetrics
+          // (which runs next, off this same snapshot) doesn't treat the row as
+          // still-paused and rewrite a "Killed by …" Results line we just cleared.
+          const snapRow = tabState[ref.tab].rows[ref.rowNum - 1];
+          if (snapRow) {
+            snapRow[tabState[ref.tab].idx.status] = 'ACTIVE';
+            snapRow[tabState[ref.tab].idx.results] = '';
+          }
+        }
+        await appendLog([
+          easternTimestamp(),
+          String(ctNumberFromTitle(entry.name) ?? ''),
+          entry.adsetId,
+          entry.name,
+          'Rule 1',
+          'UNKILLED' + (DRY_RUN ? ' [DRY]' : ''),
+          sm.spend.toFixed(2),
+          String(sm.atc),
+          String(sm.purchases),
+          sm.cpp != null ? sm.cpp.toFixed(2) : '',
+          sm.cpcLink.toFixed(2),
+          `False kill self-reversed: settled CPC $${sm.cpcLink.toFixed(2)} ≤ $${CPC_KILL.toFixed(2)} (was $${entry.cpc || '?'} at kill) — adset reactivated`,
+          entry.account || 'Hushlab Ad Account 1',
+        ]);
+        drop();
+        actionCount++;
+      } catch (e) {
+        console.log(`! Audit for ${entry.name} failed (${e.message}) — will retry next run.`);
+      }
+    }
+
+    // Prune stale PENDING rows (adset vanished: killed by another rule, ended,
+    // or manually paused before confirmation).
+    const liveIds = new Set(liveAdsets.map((a) => a.id));
+    const before = pendingState.length;
+    pendingState = pendingState.filter((p) => p.type !== 'PENDING' || liveIds.has(p.adsetId) || minutesSinceIso(p.atIso) < PENDING_STALE_HOURS * 60);
+    if (pendingState.length !== before) stateDirty = true;
+
+    if (stateDirty && !DRY_RUN) {
+      try {
+        await writePendingState(pendingState);
+      } catch (e) {
+        console.log(`! Bot Pending write failed: ${e.message}`);
+      }
+    }
   }
 
   // Final pass: refresh metrics on already-paused adsets where Meta's billing

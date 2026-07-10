@@ -464,8 +464,15 @@ async function ensurePendingTab() {
 }
 
 async function readPendingState() {
-  await ensurePendingTab();
-  const rows = await readRange(SHEET_ID, `${PENDING_TAB}!A2:H100`);
+  // DRY_RUN never creates the tab — a missing tab just means empty state.
+  if (!DRY_RUN) await ensurePendingTab();
+  let rows;
+  try {
+    rows = await readRange(SHEET_ID, `${PENDING_TAB}!A2:H100`);
+  } catch (e) {
+    if (DRY_RUN) return [];
+    throw e;
+  }
   return rows
     .filter((r) => String(r?.[0] ?? '').trim())
     .map((r) => ({

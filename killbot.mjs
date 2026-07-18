@@ -1534,6 +1534,13 @@ async function main() {
     (a, b) => (ctNumberFromTitle(a.name) ?? Infinity) - (ctNumberFromTitle(b.name) ?? Infinity),
   );
   for (const adset of liveAdsets) {
+    // The 24h clock for Rule 2 runs from the ADSET's start_time — the moment the
+    // ads actually began delivering (Nate schedules all launches for 5am ET), NOT
+    // the campaign's created_time. A campaign is routinely built the day before
+    // it runs, so campaign creation would start the clock up to 24h early and
+    // fire Rule 2 on a test that had only been live for minutes. start_time is
+    // requested adset-level in getActiveAdsets(); campaign{} is pulled there
+    // only for id/name/status and must never be used for timing.
     const launchDate = dateFromIso(adset.start_time);
     const launchAt = new Date(adset.start_time);
     const hours = hoursSince(launchAt);

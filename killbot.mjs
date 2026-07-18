@@ -1585,6 +1585,10 @@ async function main() {
             cpc: m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
             spend: m.spend.toFixed(2),
             note: verdict.reason,
+            // Same account label the AUDIT row carries. Without it column H
+            // round-trips empty and a PENDING row loses multi-account
+            // traceability the moment anything reads it.
+            account: adset.accountLabel ?? 'Hushlab Ad Account 1',
           });
           stateDirty = true;
           console.log(`  → ${verdict.rule} strike 1: PENDING — ${verdict.reason}. Confirm on a run ≥${CONFIRM_MINUTES}m from now.`);

@@ -539,8 +539,14 @@ function minutesSinceIso(iso) {
 
 // ---------- Date helpers ----------
 
+// Accepts a Date, an ISO string, or an epoch ms number. Previously Date-only:
+// the inherited-audit callsite passed Meta's raw start_time STRING and threw
+// `d.getTime is not a function`, which was caught by the audit loop's catch and
+// silently made every inherited audit un-reactivatable until it aged out.
+// Returns NaN for unparseable input — callers must treat NaN as "unknown".
 function hoursSince(d) {
-  return (Date.now() - d.getTime()) / 36e5;
+  const t = d instanceof Date ? d.getTime() : new Date(d).getTime();
+  return Number.isFinite(t) ? (Date.now() - t) / 36e5 : NaN;
 }
 
 function dateFromIso(iso) {
@@ -1926,7 +1932,14 @@ async function main() {
         const cpcRecovered = sm.cpcLink != null && sm.linkClicks > 0 && sm.cpcLink <= CPC_KILL;
         let stillCondemned = null;
         if (cpcRecovered && entry.type === 'AUDIT-INH') {
-          const sHours = hoursSince(startJ.start_time);
+          const sHours = hoursSince(new Date(startJ.start_time));
+          if (!Number.isFinite(sHours)) {
+            // Cannot evaluate the executing rule without a usable age. Fail
+            // SAFE: leave the adset paused and retry rather than reactivating
+            // an adset that may still be genuinely condemned.
+            console.log(`! Audit ${entry.name}: unparseable start_time (${startJ.start_time}) — cannot re-check executing rule, retrying next run.`);
+            continue;
+          }
           stillCondemned = nonCpcVerdict(sm, sHours, breakeven);
           if (stillCondemned) {
             console.log(`Audit ${entry.name}: CPC settled to $${sm.cpcLink.toFixed(2)} but ${stillCondemned.rule} still holds on settled data — kill CONFIRMED.`);
@@ -1977,11 +1990,18 @@ async function main() {
       }
     }
 
-    // Prune stale PENDING rows (adset vanished: killed by another rule, ended,
-    // or manually paused before confirmation).
+    // Prune stale rows. PENDING: adset vanished (killed by another rule, ended,
+    // or manually paused before confirmation). AUDIT/AUDIT-INH: normally dropped
+    // by the audit loop above, but if the status fetch throws every run (a
+    // DELETED adset returns a non-retryable Meta error) the loop's catch
+    // swallows it and drop() never runs — so age them out here too. Without
+    // this an audit row for a deleted adset is immortal and re-hits the failing
+    // API call on every single run.
     const liveIds = new Set(liveAdsets.map((a) => a.id));
     const before = pendingState.length;
-    pendingState = pendingState.filter((p) => p.type !== 'PENDING' || liveIds.has(p.adsetId) || minutesSinceIso(p.atIso) < PENDING_STALE_HOURS * 60);
+    pendingState = pendingState.filter(
+      (p) => liveIds.has(p.adsetId) || minutesSinceIso(p.atIso) < PENDING_STALE_HOURS * 60,
+    );
     if (pendingState.length !== before) stateDirty = true;
 
     if (stateDirty && !DRY_RUN) {

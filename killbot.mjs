@@ -7,7 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Rule 1 — CPC mechanical kill
-//   IF adset.spend ≥ $15 AND (link_clicks = 0 OR cpc > $2.50) → PAUSE adset.
+//   IF adset.spend ≥ $25 AND (link_clicks = 0 OR cpc > $2.50) → PAUSE adset.
 //   CPC here = cost per LINK click (Ads Manager's "CPC (cost per link click)"
 //   column — the metric Nate's Performance view and the Hit Rate sheet use).
 //   Switched from outbound clicks 2026-07-09 after the CT83 false kill: at
@@ -16,14 +16,17 @@
 //   lags link-click reporting by up to hours on fresh adsets; link clicks are
 //   both the rule's actual definition and the fresher signal.
 //   Reasoning: a new adset = a new test. If click economics are broken once
-//   $15 is spent, the test is failing fast. Doing this at the adset level
+//   $25 is spent, the test is failing fast. Doing this at the adset level
 //   (not campaign) prevents a single bad test from hiding inside a healthy
-//   CBO's averaged CPC. The $15 floor is half the prior $30 campaign floor —
-//   split per-adset, the noise tolerance scales with the spend per test.
+//   CBO's averaged CPC. The floor was raised $15 → $25 on 2026-07-18: at $15 a
+//   first strike often landed on only 6-10 clicks, where a single click swings
+//   CPC ~$0.30 and Meta's attribution has not settled. CT89 read $3+ at the $15
+//   floor and settled to $2.23 — a false kill. $25 puts more clicks behind the
+//   first strike without letting a real loser run.
 //   The zero-click branch (added 2026-06-16) is critical: a dead ad with 0
 //   link clicks has a NULL cost-per-link-click, so the cpc > $2.50 test
 //   silently skips it — meaning the WORST ads were the most protected. CT41
-//   drifted to $53 with 0 clicks before any other rule caught it. Now $15 spent
+//   drifted to $53 with 0 clicks before any other rule caught it. Now $25 spent
 //   with 0 clicks = infinite effective CPC = immediate kill.
 //
 //   TWO-STRIKE CONFIRMATION (added 2026-07-10 after the CT84 false kill):
@@ -65,7 +68,7 @@
 // Rule 4 — REMOVED (was: 7-day verdict). Distracting; not needed now.
 //
 // All breakeven values pull live from KPI sheet G2. Fixed-dollar values in
-// Rule 1 ($15, $2.50) are click economics, not CPP-derived, so they don't
+// Rule 1 ($25, $2.50) are click economics, not CPP-derived, so they don't
 // scale with AOV/COGS changes.
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +123,7 @@ const META_API = 'https://graph.facebook.com/v25.0';
 const DRY_RUN = (process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false';
 const RECONCILE_WINDOW_DAYS = 7; // refresh settled metrics for adsets paused within this many days
 
-const CPC_MIN_SPEND = 15;
+const CPC_MIN_SPEND = 25;
 const CPC_KILL = 2.5;
 
 // Rule 1 two-strike + post-kill audit (see header). State lives on the
@@ -555,7 +558,7 @@ function formatDateMDY(yyyyMmDd) {
 function evaluate(m, hoursSinceAdsetStart, breakeven) {
   // Rule 1a — zero-click kill. A dead ad gets NO link clicks, which means
   // cost-per-link-click is null and the CPC branch below silently skips it
-  // (the worst ads were the most protected). If $15 is spent and not a single
+  // (the worst ads were the most protected). If $25 is spent and not a single
   // link click landed, effective CPC is infinite — kill it. (Added 2026-06-16
   // after CT41 drifted to $53 with 0 clicks while invisible to the CPC branch.)
   if (m.spend >= CPC_MIN_SPEND && m.linkClicks === 0) {

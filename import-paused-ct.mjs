@@ -89,10 +89,10 @@ async function readRange(spreadsheetId, range) {
   if (!verdict) {
     // True manual kill — no automated rule fired. Build an honest reason. If the
     // CPC (cost per link click) was already over the Rule 1 line ($2.50) but
-    // spend hadn't yet reached the $15 Rule 1 floor, note that the CPC was
-    // trending to a kill — i.e. the bot would have caught it at $15 spent.
+    // spend hadn't yet reached the $25 Rule 1 floor, note that the CPC was
+    // trending to a kill — i.e. the bot would have caught it at $25 spent.
     const CPC_KILL = 2.5;
-    const CPC_MIN_SPEND = 15;
+    const CPC_MIN_SPEND = 25;
     const cpcOverLine = m.cpcLink != null && m.cpcLink > CPC_KILL;
     const underFloor = m.spend < CPC_MIN_SPEND;
     let reason = `Paused manually in Ads Manager at $${m.spend.toFixed(2)} after ${hours.toFixed(1)}h (did not trip an automated kill rule)`;

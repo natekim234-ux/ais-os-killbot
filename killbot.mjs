@@ -455,7 +455,10 @@ async function appendLog(row) {
 //
 // Row shape: [Adset ID, Type, Timestamp (UTC ISO), Adset Name, CPC, Spend, Note]
 //   Type 'PENDING' — Rule 1 breach seen once; kill allowed only ≥CONFIRM_MINUTES later.
-//   Type 'AUDIT'   — Rule 1 kill executed; settled re-check due ≥AUDIT_MIN_MINUTES later.
+//   Type 'AUDIT'     — Rule 1 kill executed; settled re-check due ≥AUDIT_MIN_MINUTES later.
+//   Type 'AUDIT-INH' — Rule 2/3 kill executed while a Rule 1 breach was still
+//                      pending. Same settled re-check, plus the executing rule
+//                      must ALSO have cleared on settled data to reactivate.
 // The tab is tiny (a handful of rows) so each run reads it fully and rewrites
 // it fully — no row-index bookkeeping to corrupt.
 
@@ -1547,6 +1550,12 @@ async function main() {
 
     let verdict = evaluate(m, hours, breakeven);
 
+    // True when a Rule 1 (CPC) breach was live but unconfirmed at the moment
+    // another rule executed the kill. Such a kill inherits Rule 1's post-kill
+    // UNKILLED audit — the CPC breach condemned the adset without ever earning
+    // its 2nd strike, so it must keep the path back.
+    let hadPendingRule1 = false;
+
     // Rule 1 two-strike: first breach only flags PENDING; the kill executes on
     // a later run once the flag is ≥CONFIRM_MINUTES old AND the breach still
     // holds against fresher data. A breach that clears in between is a
@@ -1583,6 +1592,10 @@ async function main() {
           ]);
           verdict = nonCpcVerdict(m, hours, breakeven);
           if (!verdict) continue;
+          // The Rule 1 breach is real and still unconfirmed. Whatever rule
+          // executes the kill inherits Rule 1's audit entitlement — see
+          // hadPendingRule1 below.
+          hadPendingRule1 = true;
           console.log(`  → Rule 1 pending, but ${verdict.rule} holds on its own — proceeding single-strike.`);
         } else {
           const ageMin = minutesSinceIso(pendingState[pIdx].atIso);
@@ -1590,6 +1603,7 @@ async function main() {
             console.log(`  → ${verdict.rule} still breached — pending ${ageMin.toFixed(0)}m/${CONFIRM_MINUTES}m, waiting.`);
             verdict = nonCpcVerdict(m, hours, breakeven);
             if (!verdict) continue;
+            hadPendingRule1 = true;
             console.log(`  → Rule 1 pending, but ${verdict.rule} holds on its own — proceeding single-strike.`);
           } else {
             // (2nd strike confirmed. The PENDING row is removed only AFTER the
@@ -1650,10 +1664,19 @@ async function main() {
         pendingState.splice(spent, 1);
         stateDirty = true;
       }
-      if (verdict.rule === 'Rule 1') {
+      // Rule 1 kills always get the settled-data audit. So do kills executed by
+      // Rule 2/3 while a Rule 1 breach was still pending confirmation: the CPC
+      // breach is what actually condemned the adset, and it never got its 2nd
+      // strike. Without this, an adset ≥24h with 0 ATC and an unsettled CPC
+      // spike dies single-strike with no path back (the exact false-kill class
+      // the audit exists to reverse).
+      if (verdict.rule === 'Rule 1' || hadPendingRule1) {
+        // Type carries the inheritance flag because pending state round-trips
+        // through an 8-column sheet — an extra object field would be silently
+        // dropped on the next run and the guard below would never fire.
         pendingState.push({
           adsetId: adset.id,
-          type: 'AUDIT',
+          type: verdict.rule === 'Rule 1' ? 'AUDIT' : 'AUDIT-INH',
           atIso: new Date().toISOString(),
           name: adset.name,
           cpc: m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
@@ -1721,7 +1744,7 @@ async function main() {
       if (verdict.rule === 'Rule 1' && m.cpcLink != null) {
         verdict.reason = `CPC $${m.cpcLink.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend` + (verdict.confirmNote ?? '');
       } else if (verdict.rule === 'Rule 2') {
-        verdict.reason = `Zero buying intent at $${m.spend.toFixed(2)} after ${hours.toFixed(1)}h (≥1× breakeven $${breakeven.toFixed(2)})`;
+        verdict.reason = `Zero buying intent at $${m.spend.toFixed(2)} after ${hours.toFixed(1)}h (≥$${CPC_MIN_SPEND} floor)`;
       } else if (verdict.rule === 'Rule 3') {
         verdict.reason = `Post-ATC bleed: ${m.atc} ATC, 0 purchases at $${m.spend.toFixed(2)} (≥2× breakeven $${(2 * breakeven).toFixed(2)})`;
       }
@@ -1860,14 +1883,15 @@ async function main() {
     ]);
   }
 
-  // Post-kill audit: for every Rule 1 kill ≥AUDIT_MIN_MINUTES old, re-pull the
+  // Post-kill audit: for every Rule 1 kill (and every Rule 2/3 kill that fired
+  // while a Rule 1 breach was pending — type AUDIT-INH) ≥AUDIT_MIN_MINUTES old, re-pull the
   // settled insights. Settled CPC ≤ $3.00 with ≥1 link click = false kill →
   // reactivate, restore sheet Status, log UNKILLED. Still breached = confirmed,
   // drop the audit row. Never touches an adset that isn't still PAUSED (so a
   // manual reactivation or delete is never fought).
   if (pendingState !== null) {
     for (const entry of [...pendingState]) {
-      if (entry.type !== 'AUDIT') continue;
+      if (entry.type !== 'AUDIT' && entry.type !== 'AUDIT-INH') continue;
       const ageMin = minutesSinceIso(entry.atIso);
       if (ageMin < AUDIT_MIN_MINUTES) continue;
       const drop = () => {
@@ -1885,14 +1909,32 @@ async function main() {
         }
         const startJ = await metaGet(entry.adsetId, { fields: 'start_time' });
         const sm = await fetchAdsetMetrics(entry.adsetId, dateFromIso(startJ.start_time));
-        // A Rule 1 kill required ≥$15 spend, so a settled read below that is a
+        // A Rule 1 kill required ≥$25 spend, so a settled read below that is a
         // transient blank/partial insights response (the CT33 false-0% mode) —
         // retry next run instead of "confirming" the kill on bogus data.
         if (sm.spend < CPC_MIN_SPEND) {
           console.log(`! Audit ${entry.name}: settled insights look blank (spend $${sm.spend.toFixed(2)} < $${CPC_MIN_SPEND}) — retrying next run.`);
           continue;
         }
-        const falseKill = sm.cpcLink != null && sm.linkClicks > 0 && sm.cpcLink <= CPC_KILL;
+        // The audit only ever reverses a CPC misread. An inherited audit (a
+        // Rule 2/3 kill that happened while a Rule 1 breach was pending) must
+        // ALSO still satisfy the rule that actually executed the kill before it
+        // can be reactivated — otherwise a settled-CPC recovery would resurrect
+        // an adset that genuinely has zero buying intent. Re-run the real rules
+        // against settled data with the CPC branch muted: if a non-CPC rule
+        // still fires, the kill stands on its own merits.
+        const cpcRecovered = sm.cpcLink != null && sm.linkClicks > 0 && sm.cpcLink <= CPC_KILL;
+        let stillCondemned = null;
+        if (cpcRecovered && entry.type === 'AUDIT-INH') {
+          const sHours = hoursSince(startJ.start_time);
+          stillCondemned = nonCpcVerdict(sm, sHours, breakeven);
+          if (stillCondemned) {
+            console.log(`Audit ${entry.name}: CPC settled to $${sm.cpcLink.toFixed(2)} but ${stillCondemned.rule} still holds on settled data — kill CONFIRMED.`);
+            drop();
+            continue;
+          }
+        }
+        const falseKill = cpcRecovered;
         if (!falseKill) {
           console.log(`Audit ${entry.name}: kill CONFIRMED on settled data (CPC ${sm.cpcLink != null ? '$' + sm.cpcLink.toFixed(2) : '— no clicks'} at $${sm.spend.toFixed(2)}).`);
           drop();
@@ -1992,6 +2034,7 @@ export {
   fetchAdCopyBody,
   fetchPctOfCampaignSpend7d,
   evaluate,
+  nonCpcVerdict,
   writeCell,
   appendLog,
   ensureBotLogLayout,

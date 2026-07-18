@@ -6,11 +6,11 @@ Hourly GitHub Actions cron that enforces 3 adset-level kill rules on Hushlab's M
 
 | Rule | Trigger | Why |
 |---|---|---|
-| **1. CPC mechanical** | `spend ≥ $25 AND (link_clicks = 0 OR CPC > $2.50)` — CPC = cost per link click, same metric as the Ads Manager CPC column | A new adset is a new test. If click economics are broken once $25 is spent, kill fast. The zero-click branch is critical: a dead ad has 0 link clicks, so cost-per-link-click is null and the CPC test silently skips it — the worst ads were the most protected (CT41 hit $53 with 0 clicks). Adset-level so a bad test can't hide inside a healthy CBO's averaged CPC. |
+| **1. CPC mechanical** | `spend ≥ $25 AND (link_clicks = 0 OR CPC > $3.00)` — CPC = cost per link click, same metric as the Ads Manager CPC column | A new adset is a new test. If click economics are broken once $25 is spent, kill fast. The zero-click branch is critical: a dead ad has 0 link clicks, so cost-per-link-click is null and the CPC test silently skips it — the worst ads were the most protected (CT41 hit $53 with 0 clicks). Adset-level so a bad test can't hide inside a healthy CBO's averaged CPC. |
 | **2. Zero buying intent** | `spend ≥ 1× breakeven CPP AND hours ≥ 24 AND ATC = 0 AND purchases = 0` | One full breakeven spent, one full day cycle, zero buying signal → click→site is broken. Stop bleeding. |
 | **3. Post-ATC bleed** | `spend ≥ 2× breakeven CPP AND ATC ≥ 1 AND purchases = 0` | ATC proves click→cart works (earns more rope than Rule 2). At 2× breakeven with no purchase, the cart is dying at checkout — copy/urgency problem, very unlikely to flip profitable. |
 
-Breakeven CPP pulls live from KPI sheet G2 ($35.31 today). Rule 1's $25/$2.50 are fixed click economics. (Floor raised $15 → $25 on 2026-07-18: at $15 the first strike often landed on 6-10 clicks before Meta's attribution settled, causing false kills like CT89 — read $3+, settled $2.23.)
+Breakeven CPP pulls live from KPI sheet G2 ($35.31 today). Rule 1's $25/$3.00 are fixed click economics. (Floor raised $15 → $25 on 2026-07-18: at $15 the first strike often landed on 6-10 clicks before Meta's attribution settled, causing false kills like CT89 — read $3+, settled $2.23.) CPC line raised $2.50 → $3.00 same day: $2.50 sat on top of the observed CPC band (CT89 $2.23, CT83 $2.29), so jitter alone tripped kills the audit had to reverse.
 
 (Old Rule 4 — 7-day verdict — was removed 2026-05-25.)
 

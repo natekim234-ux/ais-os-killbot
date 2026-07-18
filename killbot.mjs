@@ -7,7 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Rule 1 — CPC mechanical kill
-//   IF adset.spend ≥ $25 AND (link_clicks = 0 OR cpc > $2.50) → PAUSE adset.
+//   IF adset.spend ≥ $25 AND (link_clicks = 0 OR cpc > $3.00) → PAUSE adset.
 //   CPC here = cost per LINK click (Ads Manager's "CPC (cost per link click)"
 //   column — the metric Nate's Performance view and the Hit Rate sheet use).
 //   Switched from outbound clicks 2026-07-09 after the CT83 false kill: at
@@ -24,7 +24,7 @@
 //   floor and settled to $2.23 — a false kill. $25 puts more clicks behind the
 //   first strike without letting a real loser run.
 //   The zero-click branch (added 2026-06-16) is critical: a dead ad with 0
-//   link clicks has a NULL cost-per-link-click, so the cpc > $2.50 test
+//   link clicks has a NULL cost-per-link-click, so the cpc > $3.00 test
 //   silently skips it — meaning the WORST ads were the most protected. CT41
 //   drifted to $53 with 0 clicks before any other rule caught it. Now $25 spent
 //   with 0 clicks = infinite effective CPC = immediate kill.
@@ -41,7 +41,7 @@
 //   they're cumulative-spend + time-gated, so lag can't fake them.
 //
 //   POST-KILL AUDIT (same date): ≥60 min after any Rule 1 kill, the bot
-//   re-pulls settled insights for the killed adset. If settled CPC ≤ $2.50
+//   re-pulls settled insights for the killed adset. If settled CPC ≤ $3.00
 //   with ≥1 link click, the kill was false — the bot reactivates the adset,
 //   restores the sheet Status to ACTIVE, clears the Results line, and logs
 //   UNKILLED to Bot Log. False kills self-heal within ~2 hours.
@@ -68,7 +68,7 @@
 // Rule 4 — REMOVED (was: 7-day verdict). Distracting; not needed now.
 //
 // All breakeven values pull live from KPI sheet G2. Fixed-dollar values in
-// Rule 1 ($25, $2.50) are click economics, not CPP-derived, so they don't
+// Rule 1 ($25, $3.00) are click economics, not CPP-derived, so they don't
 // scale with AOV/COGS changes.
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,7 +124,11 @@ const DRY_RUN = (process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false';
 const RECONCILE_WINDOW_DAYS = 7; // refresh settled metrics for adsets paused within this many days
 
 const CPC_MIN_SPEND = 25;
-const CPC_KILL = 2.5;
+// Raised $2.50 -> $3.00 on 2026-07-18. At $2.50 the line sat on top of the
+// observed CPC band for these tests (CT89 settled $2.23, CT83 $2.29), so normal
+// attribution jitter pushed live reads over the line and triggered kills the
+// UNKILLED audit then had to reverse. $3.00 clears that band.
+const CPC_KILL = 3.0;
 
 // Rule 1 two-strike + post-kill audit (see header). State lives on the
 // 'Bot Pending' sheet tab so it survives across runs (bot is stateless).
@@ -567,7 +571,7 @@ function evaluate(m, hoursSinceAdsetStart, breakeven) {
       reason: `Zero link clicks at $${m.spend.toFixed(2)} spend (≥$${CPC_MIN_SPEND} floor)`,
     };
   }
-  // Rule 1b — CPC mechanical kill. Once clicks exist, kill if CPC > $2.50.
+  // Rule 1b — CPC mechanical kill. Once clicks exist, kill if CPC > $3.00.
   // CPC = cost per link click (see header) — switched from outbound 2026-07-09.
   if (m.spend >= CPC_MIN_SPEND && m.cpcLink != null && m.cpcLink > CPC_KILL) {
     return {
@@ -1839,7 +1843,7 @@ async function main() {
   }
 
   // Post-kill audit: for every Rule 1 kill ≥AUDIT_MIN_MINUTES old, re-pull the
-  // settled insights. Settled CPC ≤ $2.50 with ≥1 link click = false kill →
+  // settled insights. Settled CPC ≤ $3.00 with ≥1 link click = false kill →
   // reactivate, restore sheet Status, log UNKILLED. Still breached = confirmed,
   // drop the audit row. Never touches an adset that isn't still PAUSED (so a
   // manual reactivation or delete is never fought).

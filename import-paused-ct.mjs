@@ -59,7 +59,7 @@ async function readRange(spreadsheetId, range) {
 
   // Breakeven CPP from KPI sheet (same source the bot uses).
   const kpi = await readRange(KPI_SHEET_ID, 'KPI calculation!G2');
-  const breakeven = Number(String(kpi[0]?.[0] ?? '35.31').replace(/[^0-9.]/g, '')) || 35.31;
+  const breakeven = Number(String(kpi[0]?.[0] ?? '16.44').replace(/[^0-9.]/g, '')) || 16.44;
   console.log(`Breakeven CPP: $${breakeven.toFixed(2)}`);
 
   // Adset basics — works even though it's PAUSED (we fetch by ID, not the ACTIVE list).

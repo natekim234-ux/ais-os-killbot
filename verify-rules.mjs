@@ -6,7 +6,7 @@ process.env.GOOGLE_SA_JSON = '{"client_email":"d","private_key":"d"}';
 
 const { evaluate } = await import('./killbot.mjs');
 
-const BREAKEVEN = 35.31;
+const BREAKEVEN = 16.44; // live KPI sheet G2 value (was 35.31 — stale, hid the Rule1/Rule2 floor gap)
 
 // m shape: { spend, linkClicks, cpcLink, atc, purchases }
 const scenarios = [
@@ -24,6 +24,18 @@ const scenarios = [
   ['L. CPC $3.01 but only $20 spend, 2h',                { spend: 20.00, linkClicks: 6,  cpcLink: 3.01, atc: 0, purchases: 0 }, 2],
   ['M. CT89 replay: $40 spend, CPC $2.23, 5h',           { spend: 40.00, linkClicks: 18, cpcLink: 2.23, atc: 0, purchases: 0 }, 5],
   ['N. CT83 replay: $16 spend, CPC $2.29, 6h',           { spend: 16.00, linkClicks: 7,  cpcLink: 2.29, atc: 0, purchases: 0 }, 6],
+  // --- Rule1/Rule2 floor-gap regressions (the $16.44-$25 band). Before the
+  // 2026-07-18 gate change these were killed by Rule 2: single-strike, no
+  // UNKILLED audit. All three must now STAY ON until $25 is actually spent.
+  ['O. band: $17 spend, CPC $5.67, 25h, 0 ATC',          { spend: 17.00, linkClicks: 3,  cpcLink: 5.67, atc: 0, purchases: 0 }, 25],
+  ['P. band: $20 spend, 0 link clicks, 26h',             { spend: 20.00, linkClicks: 0,  cpcLink: null, atc: 0, purchases: 0 }, 26],
+  ['Q. band: $24 spend, CPC $6.00, 26h, 0 ATC',          { spend: 24.00, linkClicks: 4,  cpcLink: 6.00, atc: 0, purchases: 0 }, 26],
+  // Throttled adset: 24h elapsed but barely spent. Must NOT die on $12.
+  ['R. throttled: $12 spend, CPC $2.00, 30h, 0 ATC',     { spend: 12.00, linkClicks: 6,  cpcLink: 2.00, atc: 0, purchases: 0 }, 30],
+  // Once it clears $25 with a full day and no carts, Rule 2 SHOULD fire.
+  ['S. $26 spend, CPC $2.00, 25h, 0 ATC',                { spend: 26.00, linkClicks: 13, cpcLink: 2.00, atc: 0, purchases: 0 }, 25],
+  // Rule 3 still keyed to 2x breakeven ($32.88), unchanged.
+  ['T. $33 spend, CPC $2.00, 30h, 1 ATC, 0 buys',        { spend: 33.00, linkClicks: 16, cpcLink: 2.00, atc: 1, purchases: 0 }, 30],
 ];
 
 for (const [label, m, hours] of scenarios) {

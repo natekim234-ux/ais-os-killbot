@@ -46,15 +46,22 @@
 //   restores the sheet Status to ACTIVE, clears the Results line, and logs
 //   UNKILLED to Bot Log. False kills self-heal within ~2 hours.
 //
-// Rule 2 — Zero buying intent at 1× breakeven CPP
-//   IF adset.spend ≥ 1× breakeven CPP ($16.44 as of 2026-07-10 KPI sheet)
+// Rule 2 — Zero buying intent after 24h (gated at the $25 Rule 1 floor)
+//   IF adset.spend ≥ $25 (same floor as Rule 1)
 //      AND adset.hours_since_start ≥ 24
 //      AND adset.ATC = 0 AND adset.purchases = 0
 //   → PAUSE adset.
-//   Reasoning: by definition we've spent one full CPP worth of budget and
-//   produced zero buying signal across a full 24h cycle. The click→site
-//   transition is broken (or the offer/LP is) — the ad is not profitable
-//   and not getting more rope.
+//   Reasoning: a full 24h cycle with real spend behind it and zero buying
+//   signal means the click→site transition is broken (or the offer/LP is).
+//   Gate changed from 1× breakeven ($16.44) to the $25 Rule 1 floor on
+//   2026-07-18. Breakeven sat BELOW the Rule 1 floor, so any adset in the
+//   $16.44-$25 band bypassed Rule 1 (the only rule with a two-strike +
+//   UNKILLED audit) and was killed by Rule 2 instead — single-strike,
+//   un-audited, irreversible, on exactly the unsettled early data the audit
+//   exists to reverse. Sharing the floor closes that gap and makes the
+//   "24h means it has spent real money" assumption explicit rather than
+//   assumed (a throttled adset can sit at $12 after 24h; zero ATC on $12
+//   is not a signal).
 //
 // Rule 3 — Post-ATC bleed at 2× breakeven CPP
 //   IF adset.spend ≥ 2× breakeven CPP ($32.88 as of 2026-07-10 KPI sheet)
@@ -579,15 +586,25 @@ function evaluate(m, hoursSinceAdsetStart, breakeven) {
       reason: `CPC $${m.cpcLink.toFixed(2)} > $${CPC_KILL.toFixed(2)} at $${m.spend.toFixed(2)} spend`,
     };
   }
+  // Rule 2 — zero buying intent after a full day.
+  // Gate is CPC_MIN_SPEND ($25), NOT breakeven. Changed 2026-07-18. Two reasons:
+  //   1. Intent: 24h on a live test is assumed to have cleared $25. Making that
+  //      assumption explicit stops the rule firing on a throttled/under-delivered
+  //      adset that only managed $12 — zero ATC on $12 is not a signal.
+  //   2. Safety: Rule 1 (the only rule with a two-strike + UNKILLED audit) cannot
+  //      fire below $25. When Rule 2's gate sat at breakeven ($16.44) any adset in
+  //      the $16.44-$25 band skipped Rule 1 entirely and died by Rule 2 — a
+  //      single-strike, un-audited, irreversible kill on exactly the unsettled
+  //      early data the audit exists to catch. Sharing the floor closes that gap.
   if (
-    m.spend >= breakeven &&
+    m.spend >= CPC_MIN_SPEND &&
     hoursSinceAdsetStart >= 24 &&
     m.atc === 0 &&
     m.purchases === 0
   ) {
     return {
       rule: 'Rule 2',
-      reason: `Zero buying intent at $${m.spend.toFixed(2)} after ${hoursSinceAdsetStart.toFixed(1)}h (≥1× breakeven $${breakeven.toFixed(2)})`,
+      reason: `Zero buying intent at $${m.spend.toFixed(2)} after ${hoursSinceAdsetStart.toFixed(1)}h (≥$${CPC_MIN_SPEND} floor)`,
     };
   }
   const atcKillLine = 2 * breakeven;
@@ -1407,7 +1424,8 @@ async function main() {
   }
   console.log(`Learnings doc: ${LEARNINGS_DOC_ID}`);
 
-  // Breakeven CPP from KPI sheet (formatted "$35.31").
+  // Breakeven CPP from KPI sheet G2 (formatted "$16.44"). Fallback must match
+  // the live sheet value — see import-paused-ct.mjs, which shares this fallback.
   const kpi = await readRange(KPI_SHEET_ID, 'KPI calculation!G2');
   const breakevenRaw = String(kpi[0]?.[0] ?? '16.44').replace(/[^0-9.]/g, '');
   const breakeven = Number(breakevenRaw) || 16.44;

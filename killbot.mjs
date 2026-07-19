@@ -63,14 +63,20 @@
 //   assumed (a throttled adset can sit at $12 after 24h; zero ATC on $12
 //   is not a signal).
 //
-// Rule 3 — Post-ATC bleed at 2× breakeven CPP
-//   IF adset.spend ≥ 2× breakeven CPP ($32.88 as of 2026-07-10 KPI sheet)
+// Rule 3 — Post-ATC bleed at 2× breakeven CPP, after a full day
+//   IF adset.spend ≥ 2× breakeven CPP (pulled live from KPI sheet G2)
+//      AND hours since adset start_time ≥ 24 (same clock as Rule 2)
 //      AND adset.ATC ≥ 1 AND adset.purchases = 0
 //   → PAUSE adset.
 //   Reasoning: an ATC proves click→cart works, so it earns more rope than
 //   Rule 2 — but at 2× breakeven with no purchase, the cart is dying at
 //   checkout. That's a copy/urgency problem (not a traffic problem) and is
 //   very unlikely to flip profitable. Kill the test, iterate the copy.
+//   24h floor added 2026-07-19: Meta front-loads delivery and carts need
+//   hours to close (evening ATCs convert next morning). KPI sheet inputs
+//   corrected same day — AOV $32.98→$64.86, COGS $9.15→$16.08, weighted
+//   from the 8 real collagen orders + MutualDropship fulfillment costs
+//   ($8.60/1btl, $18.03/3, $26.88/5, $31.26/6). Breakeven ≈$40, line ≈$81.
 //
 // Rule 4 — REMOVED (was: 7-day verdict). Distracting; not needed now.
 //
@@ -616,11 +622,21 @@ function evaluate(m, hoursSinceAdsetStart, breakeven) {
       reason: `Zero buying intent at $${m.spend.toFixed(2)} after ${hoursSinceAdsetStart.toFixed(1)}h (≥$${CPC_MIN_SPEND} floor)`,
     };
   }
+  // Rule 3 — post-ATC bleed. 24h floor added 2026-07-19 (same clock as Rule 2:
+  // adset start_time). Two reasons: Meta front-loads delivery, so the spend line
+  // can be hit by early afternoon; and carts need hours to close — evening ATCs
+  // routinely convert the next morning (CT89's 2 initiate-checkouts died same-day
+  // exactly this way). At $100/day the extra protection costs at most ~$20.
   const atcKillLine = 2 * breakeven;
-  if (m.spend >= atcKillLine && m.atc >= 1 && m.purchases === 0) {
+  if (
+    m.spend >= atcKillLine &&
+    hoursSinceAdsetStart >= 24 &&
+    m.atc >= 1 &&
+    m.purchases === 0
+  ) {
     return {
       rule: 'Rule 3',
-      reason: `Post-ATC bleed: ${m.atc} ATC, 0 purchases at $${m.spend.toFixed(2)} (≥2× breakeven $${atcKillLine.toFixed(2)})`,
+      reason: `Post-ATC bleed: ${m.atc} ATC, 0 purchases at $${m.spend.toFixed(2)} (≥2× breakeven $${atcKillLine.toFixed(2)}) after ${hoursSinceAdsetStart.toFixed(1)}h`,
     };
   }
   return null;

@@ -36,6 +36,11 @@ const scenarios = [
   ['S. $26 spend, CPC $2.00, 25h, 0 ATC',                { spend: 26.00, linkClicks: 13, cpcLink: 2.00, atc: 0, purchases: 0 }, 25],
   // Rule 3 still keyed to 2x breakeven ($32.88), unchanged.
   ['T. $33 spend, CPC $2.00, 30h, 1 ATC, 0 buys',        { spend: 33.00, linkClicks: 16, cpcLink: 2.00, atc: 1, purchases: 0 }, 30],
+  // --- Rule 3 24h floor (added 2026-07-19). Same clock as Rule 2. Carts need
+  // hours to close — Rule 3 must NOT fire same-day even past the spend line.
+  ['U. CT89 replay: $59.57 spend, 4 ATC, 0 buys, 12h',   { spend: 59.57, linkClicks: 23, cpcLink: 2.59, atc: 4, purchases: 0 }, 12],
+  ['V. same as U but 25h — now Rule 3 fires',            { spend: 59.57, linkClicks: 23, cpcLink: 2.59, atc: 4, purchases: 0 }, 25],
+  ['W. $33 spend, 1 ATC, 0 buys, 23.9h — just under',    { spend: 33.00, linkClicks: 16, cpcLink: 2.00, atc: 1, purchases: 0 }, 23.9],
 ];
 
 for (const [label, m, hours] of scenarios) {

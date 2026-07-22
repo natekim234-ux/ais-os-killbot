@@ -45,6 +45,14 @@
 //   with ≥1 link click, the kill was false — the bot reactivates the adset,
 //   restores the sheet Status to ACTIVE, clears the Results line, and logs
 //   UNKILLED to Bot Log. False kills self-heal within ~2 hours.
+//   SETTLE-WAIT (added 2026-07-22 after CT92): Meta's insights endpoint can keep
+//   returning the stale kill-time snapshot for up to ~1h past the 60-min mark,
+//   so the audit no longer judges CPC on the first read past the mark. It re-checks
+//   each tick until spend stops climbing (delta ≤ max($1.00, 2% of last tick's
+//   spend)); only THEN does it confirm-and-drop or reactivate. CT92 was killed on
+//   an unsettled $6.32 CPC, "confirmed" on the same stale read, and only settled to
+//   $2.87 a tick later — after the row was already dropped. The settle gate stops
+//   that; the PENDING_STALE_HOURS prune still ages out a genuinely stuck row.
 //
 // Rule 2 — Zero buying intent after 24h (gated at the $25 Rule 1 floor)
 //   IF adset.spend ≥ $25 (same floor as Rule 1)
@@ -462,9 +470,14 @@ async function appendLog(row) {
 // Row shape: [Adset ID, Type, Timestamp (UTC ISO), Adset Name, CPC, Spend, Note]
 //   Type 'PENDING' — Rule 1 breach seen once; kill allowed only ≥CONFIRM_MINUTES later.
 //   Type 'AUDIT'     — Rule 1 kill executed; settled re-check due ≥AUDIT_MIN_MINUTES later.
+//                      The re-check re-runs each tick until spend settles (delta vs
+//                      the prior tick's Spend column ≤ max($1.00, 2%)) before it
+//                      judges CPC — so the Spend column doubles as the settle
+//                      baseline, rewritten each unsettled tick.
 //   Type 'AUDIT-INH' — Rule 2/3 kill executed while a Rule 1 breach was still
-//                      pending. Same settled re-check, plus the executing rule
-//                      must ALSO have cleared on settled data to reactivate.
+//                      pending. Same settled re-check (incl. the settle-wait), plus
+//                      the executing rule must ALSO have cleared on settled data to
+//                      reactivate.
 // The tab is tiny (a handful of rows) so each run reads it fully and rewrites
 // it fully — no row-index bookkeeping to corrupt.
 
@@ -1947,6 +1960,25 @@ async function main() {
         // retry next run instead of "confirming" the kill on bogus data.
         if (sm.spend < CPC_MIN_SPEND) {
           console.log(`! Audit ${entry.name}: settled insights look blank (spend $${sm.spend.toFixed(2)} < $${CPC_MIN_SPEND}) — retrying next run.`);
+          continue;
+        }
+        // Meta's insights endpoint keeps returning the STALE kill-time snapshot
+        // for up to an hour past the ≥60-min audit mark (CT92 2026-07-22: killed
+        // on $6.32 CPC at $31.59, still $6.32/$31.59 at the 66-min audit, only
+        // settled to $2.87 at $81 a tick later). Judging CPC on the FIRST read
+        // past the mark can "confirm" a kill on unsettled data. So don't judge
+        // until spend has stopped climbing: compare fresh spend to the spend we
+        // recorded last audit tick; settled when the delta is within max($1.00,
+        // 2% of prev). No baseline yet (first tick / unparseable) → not settled,
+        // store this spend and wait one tick. The PENDING_STALE_HOURS prune above
+        // still caps how long a genuinely stuck row can loop.
+        const prevSpend = parseFloat(entry.spend);
+        const settled = Number.isFinite(prevSpend)
+          && sm.spend - prevSpend <= Math.max(1.0, 0.02 * prevSpend);
+        if (!settled) {
+          console.log(`Audit ${entry.name}: insights still settling (spend $${Number.isFinite(prevSpend) ? prevSpend.toFixed(2) : '?'} → $${sm.spend.toFixed(2)}) — re-checking next tick.`);
+          entry.spend = String(sm.spend);
+          stateDirty = true;
           continue;
         }
         // The audit only ever reverses a CPC misread. An inherited audit (a

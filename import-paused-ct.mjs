@@ -40,6 +40,8 @@ import {
   hoursSince,
   sheets,
   SHEET_ID,
+  LEARNINGS_DOC_ID,
+  LEARNINGS_DOC_CELL,
 } from './killbot.mjs';
 
 const DRY_RUN = (process.env.DRY_RUN ?? 'true').toLowerCase() !== 'false';
@@ -48,6 +50,19 @@ const ADSET_ID = process.env.ADSET_ID;
 if (!ADSET_ID) throw new Error('Set ADSET_ID env var');
 
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const ACCOUNT_LABEL = process.env.ACCOUNT_LABEL || 'Hushlab Ad Account 1';
+
+// A1 column letter from 0-based index (same as killbot.mjs's private colA1).
+function colA1(index) {
+  let n = index + 1;
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
 
 async function readRange(spreadsheetId, range) {
   const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range });
@@ -56,6 +71,18 @@ async function readRange(spreadsheetId, range) {
 
 (async () => {
   console.log(`[import-paused-ct] start (DRY_RUN=${DRY_RUN}) ADSET_ID=${ADSET_ID}`);
+
+  // Guard: killbot's doc helpers write to LEARNINGS_DOC_ID (the module
+  // fallback). After a 100-tab rollover the live doc ID lives in Bot
+  // Control!B7 and the fallback goes stale — writing there would resurrect an
+  // archived doc. This one-shot can't rebind the import, so refuse to run.
+  const docCell = await readRange(SHEET_ID, LEARNINGS_DOC_CELL);
+  const liveDocId = String(docCell[0]?.[0] ?? '').trim();
+  if (liveDocId && liveDocId !== LEARNINGS_DOC_ID) {
+    throw new Error(
+      `Active Learnings doc (${LEARNINGS_DOC_CELL} = ${liveDocId}) differs from killbot.mjs fallback (${LEARNINGS_DOC_ID}). Update LEARNINGS_DOC_FALLBACK before importing.`,
+    );
+  }
 
   // Breakeven CPP from KPI sheet (same source the bot uses).
   const kpi = await readRange(KPI_SHEET_ID, 'KPI calculation!G2');
@@ -116,18 +143,25 @@ async function readRange(spreadsheetId, range) {
   let rowRef = null;
   const tabState = {};
   for (const tab of monthTabs) {
-    const rows = await readRange(SHEET_ID, `${tab}!A1:W500`);
+    // Read through AD — the "Ad Account" column inserted between Status and
+    // Results pushed Ad Set ID past W. All positions resolve by header name;
+    // no numeric fallbacks (a hardcoded offset silently misaligns after a
+    // column insert — the exact bug this rewrite removes).
+    const rows = await readRange(SHEET_ID, `${tab}!A1:AD500`);
     const header = rows[0] ?? [];
     const idx = {
       test: header.indexOf('Creative Test #'),
       launch: header.indexOf('Launch Date (double click)'),
       status: header.indexOf('Status'),
+      account: header.indexOf('Ad Account'),
       results: header.indexOf('Results'),
       hypothesis: header.findIndex((h) => String(h).includes("What's your hypothesis")),
       adsetId: header.indexOf('Ad Set ID'),
     };
-    if (idx.status < 0) idx.status = 17;
-    if (idx.results < 0) idx.results = 18;
+    if (idx.status < 0 || idx.results < 0 || idx.adsetId < 0) {
+      console.log(`  · Skipping tab '${tab}' — missing required columns. idx=${JSON.stringify(idx)}`);
+      continue;
+    }
     tabState[tab] = { rows, idx };
     for (let r = 1; r < rows.length; r++) {
       if (String(rows[r]?.[idx.adsetId] ?? '').trim() === ADSET_ID) {
@@ -149,13 +183,22 @@ async function readRange(spreadsheetId, range) {
 
   if (!DRY_RUN) await ensureBotLogLayout();
 
-  // ---- 1) Sheet col R = PAUSED, col S = Results line ----
+  // ---- 1) Sheet Status = PAUSED, Results line, Ad Account stamp ----
+  // Columns resolved by header index (never hardcoded letters) — the Ad
+  // Account column insert moved Results from S to T.
   const dateRangeShort = `${formatDateMDY(launchDate)} – ${formatDateMDY(new Date().toISOString().slice(0, 10))}`;
   if (rowRef && !DRY_RUN) {
-    await writeCell(SHEET_ID, `${rowRef.tab}!R${rowRef.rowNum}`, 'PAUSED');
+    const st = tabState[rowRef.tab];
+    await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(st.idx.status)}${rowRef.rowNum}`, 'PAUSED');
     const resultsLine = buildResultsLine({ metrics: m, kill: verdict, dateRange: dateRangeShort });
-    await writeCell(SHEET_ID, `${rowRef.tab}!S${rowRef.rowNum}`, resultsLine);
-    console.log(`  ✓ Sheet R/S written: ${resultsLine}`);
+    await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(st.idx.results)}${rowRef.rowNum}`, resultsLine);
+    if (st.idx.account >= 0) {
+      const existingAcc = String(st.rows[rowRef.rowNum - 1]?.[st.idx.account] ?? '').trim();
+      if (!existingAcc) {
+        await writeCell(SHEET_ID, `${rowRef.tab}!${colA1(st.idx.account)}${rowRef.rowNum}`, ACCOUNT_LABEL);
+      }
+    }
+    console.log(`  ✓ Sheet Status/Results written: ${resultsLine}`);
   }
 
   // ---- 2) Learnings doc tab (+ Copy sub-tab), nested under month parent ----
@@ -198,6 +241,7 @@ async function readRange(spreadsheetId, range) {
     m.cpp != null ? m.cpp.toFixed(2) : '',
     m.cpcLink != null ? m.cpcLink.toFixed(2) : '',
     verdict.reason,
+    ACCOUNT_LABEL, // Account column — parity with killbot main()'s 13-column row
   ]);
   console.log(`  ✓ Bot Log appended`);
   console.log(`[import-paused-ct] done.`);
